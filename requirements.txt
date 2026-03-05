@@ -1,0 +1,11 @@
+torch
+torchaudio
+transformers>=4.52.4
+peft
+soundfile
+gradio
+
+# Optional: needed only for specific model backends
+nemo_toolkit[asr]    # for Parakeet TDT 0.6B v3
+qwen-asr             # for Qwen3-ASR 1.7B
+bitsandbytes         # for INT8 quantization of Qwen2.5-32B
