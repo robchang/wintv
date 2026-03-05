@@ -292,11 +292,19 @@ def _load_parakeet():
     model_name = "nvidia/parakeet-tdt-0.6b-v3"
     print(f"Loading {model_name}...")
     model = nemo_asr.models.EncDecRNNTBPEModel.from_pretrained(model_name)
-    # Disable CUDA graphs (incompatible with GB10 sm_121)
+    # Disable CUDA graphs (incompatible with NeMo 2.7 + cuda-python 12.9).
+    # Set in config so change_decoding_strategy() won't re-enable them.
+    from omegaconf import open_dict
+    with open_dict(model.cfg.decoding):
+        model.cfg.decoding.greedy.use_cuda_graph_decoder = False
+        # Force segment breaks at gaps ≥100 frames (~2s at 50fps).
+        # Helps produce clean segment boundaries around music/silence gaps.
+        model.cfg.decoding.segment_gap_threshold = 100
     model.decoding.decoding.disable_cuda_graphs()
-    # Use local attention for long audio (>24 min)
+    model.decoding.decoding.use_cuda_graph_decoder = False
+    # Local attention for long audio (>24 min)
     model.change_attention_model(
-        "rel_pos_local_attn", att_context_size=[256, 256]
+        "rel_pos_local_attn", att_context_size=[128, 128]
     )
     print(f"{model_name} loaded.")
     return _set_cached("parakeet", {"model": model}, role="asr")
@@ -321,8 +329,8 @@ def _load_qwen_asr():
     return _set_cached("qwen_asr", {"model": model}, role="asr")
 
 
-def transcribe_granite(wav_path: str) -> list[tuple[str, str]]:
-    """Transcribe using Granite. Returns list of (chunk_label, text) tuples."""
+def transcribe_granite(wav_path: str) -> list[tuple[str, str, float | None, float | None]]:
+    """Transcribe using Granite. Returns list of (label, text, start, end) tuples."""
     m = _load_granite_asr()
     processor, tokenizer, model = m["processor"], m["tokenizer"], m["model"]
 
@@ -349,13 +357,13 @@ def transcribe_granite(wav_path: str) -> list[tuple[str, str]]:
             outputs[:, n:], skip_special_tokens=True
         )[0]
         label = f"Chunk {i + 1}/{len(chunks)}"
-        results.append((label, text.strip()))
+        results.append((label, text.strip(), None, None))
 
     return results
 
 
-def transcribe_granite_ast(wav_path: str) -> list[tuple[str, str]]:
-    """Direct AST: audio → Chinese using Granite. Returns (label, text) tuples."""
+def transcribe_granite_ast(wav_path: str) -> list[tuple[str, str, float | None, float | None]]:
+    """Direct AST: audio → Chinese using Granite. Returns (label, text, start, end) tuples."""
     m = _load_granite_asr()
     processor, tokenizer, model = m["processor"], m["tokenizer"], m["model"]
 
@@ -382,23 +390,93 @@ def transcribe_granite_ast(wav_path: str) -> list[tuple[str, str]]:
             outputs[:, n:], skip_special_tokens=True
         )[0]
         label = f"Chunk {i + 1}/{len(chunks)}"
-        results.append((label, text.strip()))
+        results.append((label, text.strip(), None, None))
 
     return results
 
 
-def transcribe_parakeet(wav_path: str) -> list[tuple[str, str]]:
-    """Transcribe using Parakeet. Returns single (label, text) tuple in a list."""
+def _group_words_into_subtitles(
+    words: list[dict], max_words: int = 30, max_duration: float = 15.0,
+) -> list[tuple[str, str, float, float]]:
+    """Group word-level timestamps into sentence-based subtitle chunks.
+    Splits at sentence-ending punctuation (. ! ?). Falls back to max_words/max_duration
+    to prevent overly long subtitles.
+    Returns list of (label, text, start, end) tuples."""
+    if not words:
+        return []
+
+    results = []
+    chunk_words = []
+    chunk_start = None
+    words_end = 0.0
+
+    def flush():
+        nonlocal chunk_words, chunk_start
+        if chunk_words:
+            text = " ".join(chunk_words)
+            results.append((text, chunk_start, words_end))
+            chunk_words = []
+            chunk_start = None
+
+    for w in words:
+        word_text = w.get("word", "").strip()
+        if not word_text:
+            continue
+        start = w.get("start", 0.0)
+        end = w.get("end", 0.0)
+
+        if chunk_start is None:
+            chunk_start = start
+
+        chunk_words.append(word_text)
+        words_end = end
+
+        # Flush at sentence boundaries
+        is_sentence_end = word_text[-1] in ".!?"
+        duration = end - chunk_start
+        over_limit = len(chunk_words) >= max_words or duration > max_duration
+
+        if is_sentence_end or over_limit:
+            flush()
+
+    flush()
+
+    # Add labels
+    labeled = []
+    for i, (text, s, e) in enumerate(results):
+        labeled.append((f"Seg {i + 1}/{len(results)}", text, s, e))
+    return labeled
+
+
+def transcribe_parakeet(wav_path: str) -> list[tuple[str, str, float | None, float | None]]:
+    """Transcribe using Parakeet with word-level timestamps grouped into subtitles.
+    Returns list of (label, text, start_sec, end_sec) tuples."""
     m = _load_parakeet()
     model = m["model"]
 
-    print("Transcribing with Parakeet (full audio)...")
-    output = model.transcribe([wav_path])
-    text = output[0].text if hasattr(output[0], "text") else str(output[0])
-    return [("Full audio", text.strip())]
+    print("Transcribing with Parakeet (full audio, timestamps=True)...")
+    output = model.transcribe([wav_path], timestamps=True)
+
+    hyp = output[0]
+    ts = hyp.timestamp if hasattr(hyp, "timestamp") else None
+
+    # Use word-level timestamps for fine-grained subtitles
+    words = []
+    if isinstance(ts, dict) and "word" in ts:
+        words = ts["word"]
+        print(f"  Parakeet: {len(words)} word timestamps extracted")
+
+    if words:
+        results = _group_words_into_subtitles(words)
+        print(f"  Grouped into {len(results)} subtitle segments")
+        return results
+
+    # Fallback if no word timestamps
+    text = hyp.text if hasattr(hyp, "text") else str(hyp)
+    return [("Full audio", text.strip(), None, None)]
 
 
-def transcribe_qwen_asr(wav_path: str) -> list[tuple[str, str]]:
+def transcribe_qwen_asr(wav_path: str) -> list[tuple[str, str, float | None, float | None]]:
     """Transcribe using Qwen3-ASR. Chunks to 5-min segments if needed."""
     m = _load_qwen_asr()
     model = m["model"]
@@ -411,7 +489,7 @@ def transcribe_qwen_asr(wav_path: str) -> list[tuple[str, str]]:
         print(f"Transcribing {label} with Qwen3-ASR...")
         output = model.transcribe(audio=chunk_path, language="English")
         text = output[0].text if hasattr(output[0], "text") else str(output[0])
-        results.append((label, text.strip()))
+        results.append((label, text.strip(), None, None))
 
         # Clean up temp chunk files (but not the original)
         if chunk_path != wav_path:
@@ -511,6 +589,29 @@ def translate_qwen(english_text: str) -> str:
     return result.strip()
 
 
+# --- SRT Helpers ---
+
+
+def _fmt_srt_time(seconds: float) -> str:
+    """Format seconds as SRT timecode HH:MM:SS,mmm."""
+    h = int(seconds // 3600)
+    m = int((seconds % 3600) // 60)
+    s = int(seconds % 60)
+    ms = int((seconds % 1) * 1000)
+    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+
+def generate_srt(entries: list[tuple[float, float, str]]) -> str:
+    """Generate SRT subtitle content from (start, end, text) entries."""
+    lines = []
+    for i, (start, end, text) in enumerate(entries, 1):
+        lines.append(str(i))
+        lines.append(f"{_fmt_srt_time(start)} --> {_fmt_srt_time(end)}")
+        lines.append(text)
+        lines.append("")
+    return "\n".join(lines)
+
+
 # --- Dispatch ---
 
 ASR_DISPATCH = {
@@ -539,7 +640,7 @@ def process_audio(
         raise gr.Error("Please upload an audio file first.")
 
     try:
-        yield ("", "", "", "Preprocessing audio...")
+        yield ("", "", "", "Preprocessing audio...", None, None)
         wav_path = preprocess_to_wav(audio_path)
 
         data, _ = sf.read(wav_path, dtype="float32")
@@ -552,11 +653,11 @@ def process_audio(
 
         # --- Direct AST path (Granite only) ---
         if use_direct_ast and asr_model_name == "Granite Speech 3.3-8B":
-            yield ("", "", "", "Loading Granite model...")
+            yield ("", "", "", "Loading Granite model...", None, None)
             chunks = transcribe_granite_ast(wav_path)
             all_translations = []
             all_raw = []
-            for i, (label, text) in enumerate(chunks):
+            for i, (label, text, _, _) in enumerate(chunks):
                 all_translations.append(text)
                 all_raw.append(f"[{label}]\n{text}")
                 yield (
@@ -564,29 +665,33 @@ def process_audio(
                     " ".join(all_translations),
                     "\n---\n".join(all_raw),
                     f"AST {label} done.",
+                    None, None,
                 )
             yield (
                 "(Direct AST — no separate transcription)",
                 " ".join(all_translations),
                 "\n---\n".join(all_raw),
                 f"Done! Processed {len(chunks)} chunk(s) via direct AST.",
+                None, None,
             )
             os.unlink(wav_path)
             return
 
         # --- Two-step: ASR then Translation ---
-        yield ("", "", "", f"Loading {asr_model_name}...")
+        yield ("", "", "", f"Loading {asr_model_name}...", None, None)
         transcribe_fn = ASR_DISPATCH[asr_model_name]
         translate_fn = TRANSLATE_DISPATCH[translation_model_name]
 
-        yield ("", "", "", f"Transcribing with {asr_model_name}...")
+        yield ("", "", "", f"Transcribing with {asr_model_name}...", None, None)
         asr_results = transcribe_fn(wav_path)
 
         all_transcriptions = []
         all_translations = []
         all_raw = []
+        srt_en_entries = []  # (start, end, english_text)
+        srt_zh_entries = []  # (start, end, chinese_text)
 
-        for i, (label, transcription) in enumerate(asr_results):
+        for i, (label, transcription, start, end) in enumerate(asr_results):
             all_transcriptions.append(transcription)
 
             yield (
@@ -594,23 +699,58 @@ def process_audio(
                 " ".join(all_translations),
                 "\n---\n".join(all_raw),
                 f"Translating {label} with {translation_model_name}...",
+                None, None,
             )
 
             translation = translate_fn(transcription)
+            translation = translation.strip()
 
-            all_translations.append(translation.strip())
-            all_raw.append(
-                f"[{label}]\n"
-                f"EN: {transcription}\n"
-                f"ZH: {translation.strip()}"
-            )
+            all_translations.append(translation)
+
+            # Build raw output with timecodes when available
+            if start is not None and end is not None:
+                tc = f"[{_fmt_srt_time(start)} → {_fmt_srt_time(end)}]"
+                all_raw.append(
+                    f"{tc}\n"
+                    f"EN: {transcription}\n"
+                    f"ZH: {translation}"
+                )
+                srt_en_entries.append((start, end, transcription))
+                srt_zh_entries.append((start, end, translation))
+            else:
+                all_raw.append(
+                    f"[{label}]\n"
+                    f"EN: {transcription}\n"
+                    f"ZH: {translation}"
+                )
 
             yield (
                 " ".join(all_transcriptions),
                 " ".join(all_translations),
                 "\n---\n".join(all_raw),
                 f"{label} done.",
+                None, None,
             )
+
+        # Generate SRT files if we have timestamps
+        en_srt_path = None
+        zh_srt_path = None
+        if srt_en_entries:
+            en_srt = generate_srt(srt_en_entries)
+            en_tmp = tempfile.NamedTemporaryFile(
+                suffix=".srt", prefix="english_", delete=False, mode="w",
+            )
+            en_tmp.write(en_srt)
+            en_tmp.close()
+            en_srt_path = en_tmp.name
+
+            zh_srt = generate_srt(srt_zh_entries)
+            zh_tmp = tempfile.NamedTemporaryFile(
+                suffix=".srt", prefix="chinese_", delete=False, mode="w",
+            )
+            zh_tmp.write(zh_srt)
+            zh_tmp.close()
+            zh_srt_path = zh_tmp.name
 
         yield (
             " ".join(all_transcriptions),
@@ -618,6 +758,7 @@ def process_audio(
             "\n---\n".join(all_raw),
             f"Done! {len(asr_results)} chunk(s) — "
             f"ASR: {asr_model_name}, Translation: {translation_model_name}",
+            en_srt_path, zh_srt_path,
         )
 
         os.unlink(wav_path)
@@ -663,16 +804,6 @@ with gr.Blocks(title="English Audio → Mandarin Chinese") as demo:
         visible=True,
     )
 
-    # Show/hide AST checkbox based on ASR model selection
-    def update_ast_visibility(asr_name):
-        return gr.update(visible=(asr_name == "Granite Speech 3.3-8B"))
-
-    asr_dropdown.change(
-        fn=update_ast_visibility,
-        inputs=[asr_dropdown],
-        outputs=[use_direct_ast],
-    )
-
     submit_btn = gr.Button("Transcribe & Translate", variant="primary")
 
     with gr.Row():
@@ -700,12 +831,28 @@ with gr.Blocks(title="English Audio → Mandarin Chinese") as demo:
         interactive=False,
     )
 
+    with gr.Row():
+        en_srt_output = gr.File(label="Download English SRT")
+        zh_srt_output = gr.File(label="Download Chinese SRT")
+
+    # Show/hide AST checkbox based on ASR model
+    def on_asr_change(asr_name):
+        return gr.Checkbox(visible=(asr_name == "Granite Speech 3.3-8B"))
+
+    asr_dropdown.change(
+        fn=on_asr_change,
+        inputs=[asr_dropdown],
+        outputs=[use_direct_ast],
+        show_progress="hidden",
+    )
+
     submit_btn.click(
         fn=process_audio,
         inputs=[audio_input, asr_dropdown, translation_dropdown, use_direct_ast],
         outputs=[
             transcription_output, translation_output,
             raw_output, status_output,
+            en_srt_output, zh_srt_output,
         ],
     )
 
