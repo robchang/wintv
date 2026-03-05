@@ -4,6 +4,7 @@ import subprocess
 import tempfile
 
 os.environ.setdefault("NUMBA_CACHE_DIR", "/tmp/numba_cache")
+os.environ.setdefault("TORCH_HOME", "/tmp/torch_hub")
 
 import gradio as gr
 import soundfile as sf
@@ -282,6 +283,80 @@ def _load_granite_asr():
     }, role="asr")
 
 
+def _load_silero_vad():
+    """Load Silero VAD model (lightweight, stays cached permanently)."""
+    cached = _get_cached("silero_vad")
+    if cached:
+        return cached
+    print("Loading Silero VAD...")
+    vad_model, utils = torch.hub.load(
+        repo_or_dir="snakers4/silero-vad", model="silero_vad",
+    )
+    print("Silero VAD loaded.")
+    # No role — tiny model, never unloaded
+    _model_cache["silero_vad"] = {"model": vad_model, "utils": utils}
+    return _model_cache["silero_vad"]
+
+
+def _vad_split(wav_path: str, min_gap_sec: float = 5.0) -> list[tuple[str, float]]:
+    """Use Silero VAD to split audio at long non-speech gaps.
+    Returns list of (wav_path, offset_sec) tuples.
+    Segments separated by < min_gap_sec are merged together."""
+    vad = _load_silero_vad()
+    vad_model = vad["model"]
+    get_speech_timestamps = vad["utils"][0]
+
+    data, sr = sf.read(wav_path, dtype="float32")
+    wav_tensor = torch.tensor(data)
+
+    speech_ts = get_speech_timestamps(
+        wav_tensor, vad_model,
+        sampling_rate=sr,
+        min_silence_duration_ms=500,
+        speech_pad_ms=300,
+    )
+
+    if not speech_ts:
+        print("  VAD: no speech detected, passing full audio")
+        return [(wav_path, 0.0)]
+
+    # Merge speech regions separated by < min_gap_sec
+    min_gap_samples = int(min_gap_sec * sr)
+    merged = [{"start": speech_ts[0]["start"], "end": speech_ts[0]["end"]}]
+    for region in speech_ts[1:]:
+        gap = region["start"] - merged[-1]["end"]
+        if gap < min_gap_samples:
+            merged[-1]["end"] = region["end"]
+        else:
+            merged.append({"start": region["start"], "end": region["end"]})
+
+    print(f"  VAD: {len(speech_ts)} speech regions → {len(merged)} segments "
+          f"(merged at <{min_gap_sec}s gaps)")
+
+    if len(merged) == 1:
+        # Single continuous speech region — use original file
+        return [(wav_path, 0.0)]
+
+    # Save each segment with 0.5s padding on each side
+    pad_samples = int(0.5 * sr)
+    segments = []
+    for region in merged:
+        start_sample = max(0, region["start"] - pad_samples)
+        end_sample = min(len(data), region["end"] + pad_samples)
+        chunk = data[start_sample:end_sample]
+
+        tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+        tmp.close()
+        sf.write(tmp.name, chunk, sr)
+
+        offset_sec = start_sample / sr
+        dur = (end_sample - start_sample) / sr
+        print(f"    Segment: {offset_sec:.1f}s – {offset_sec + dur:.1f}s ({dur:.1f}s)")
+        segments.append((tmp.name, offset_sec))
+
+    return segments
+
+
 def _load_parakeet():
     cached = _get_cached("parakeet")
     if cached:
@@ -449,31 +524,45 @@ def _group_words_into_subtitles(
 
 
 def transcribe_parakeet(wav_path: str) -> list[tuple[str, str, float | None, float | None]]:
-    """Transcribe using Parakeet with word-level timestamps grouped into subtitles.
+    """Transcribe using Parakeet with VAD preprocessing and word-level timestamps.
     Returns list of (label, text, start_sec, end_sec) tuples."""
     m = _load_parakeet()
     model = m["model"]
 
-    print("Transcribing with Parakeet (full audio, timestamps=True)...")
-    output = model.transcribe([wav_path], timestamps=True)
+    # Split at non-speech gaps so Parakeet doesn't lose context
+    vad_segments = _vad_split(wav_path)
 
-    hyp = output[0]
-    ts = hyp.timestamp if hasattr(hyp, "timestamp") else None
+    all_words = []
+    for seg_path, offset in vad_segments:
+        print(f"Transcribing segment at {offset:.1f}s with Parakeet...")
+        output = model.transcribe([seg_path], timestamps=True)
 
-    # Use word-level timestamps for fine-grained subtitles
-    words = []
-    if isinstance(ts, dict) and "word" in ts:
-        words = ts["word"]
-        print(f"  Parakeet: {len(words)} word timestamps extracted")
+        hyp = output[0]
+        ts = hyp.timestamp if hasattr(hyp, "timestamp") else None
 
-    if words:
-        results = _group_words_into_subtitles(words)
+        if isinstance(ts, dict) and "word" in ts:
+            for w in ts["word"]:
+                all_words.append({
+                    "word": w.get("word", ""),
+                    "start": w.get("start", 0.0) + offset,
+                    "end": w.get("end", 0.0) + offset,
+                })
+        elif hasattr(hyp, "text") and hyp.text:
+            # No word timestamps — add as a single pseudo-word
+            all_words.append({"word": hyp.text.strip(), "start": offset, "end": offset})
+
+        # Clean up temp segment files
+        if seg_path != wav_path:
+            os.unlink(seg_path)
+
+    print(f"  Parakeet: {len(all_words)} words total across {len(vad_segments)} segment(s)")
+
+    if all_words:
+        results = _group_words_into_subtitles(all_words)
         print(f"  Grouped into {len(results)} subtitle segments")
         return results
 
-    # Fallback if no word timestamps
-    text = hyp.text if hasattr(hyp, "text") else str(hyp)
-    return [("Full audio", text.strip(), None, None)]
+    return [("Full audio", "", None, None)]
 
 
 def transcribe_qwen_asr(wav_path: str) -> list[tuple[str, str, float | None, float | None]]:
