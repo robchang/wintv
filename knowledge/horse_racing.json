@@ -1,0 +1,44 @@
+{
+  "domain": "horse_racing",
+  "display_name": "Horse Racing",
+  "keywords": ["horse", "racing", "jockey", "track", "win place show", "exacta", "trifecta", "superfecta", "furlong", "handicap", "pari-mutuel"],
+  "glossary": {
+    "Win": "独赢",
+    "Place": "前二(位置)",
+    "Show": "前三(展示)",
+    "Exacta": "Exacta（连赢）",
+    "Exacta box": "Exacta复式",
+    "Exacta straight": "Exacta直选",
+    "Trifecta": "Trifecta（三重彩）",
+    "Trifecta box": "Trifecta复式",
+    "Superfecta": "Superfecta（四重彩）",
+    "Win/Place/Show": "独赢/前二/前三",
+    "pari-mutuel": "彩池投注",
+    "pari-mutuel odds": "彩池赔率",
+    "mutual odds": "彩池赔率",
+    "Pick Three": "连中三场",
+    "Pick Four": "连中四场",
+    "Pick Five": "连中五场",
+    "pick three": "连中三场",
+    "pick four": "连中四场",
+    "pick five": "连中五场"
+  },
+  "rules": [
+    "'Win/Place/Show' is a standard horse racing bet type trio. 'Place' = 前二 (top 2 finish), 'Show' = 前三 (top 3 finish). When explaining: 你选一匹马，押它跑第一（独赢）、前二或前三. Do NOT translate Place as 位置 or Show as 展示 — those are literal translations that lose the betting meaning.",
+    "For exotic bets (Exacta, Trifecta, Superfecta): keep the English name and add Chinese in full-width parentheses on first use. Use consistent formatting: Exacta（连赢）, Trifecta（三重彩）, Superfecta（四重彩）. NOT 'Exacta bet。' or 'Trifecta bet.' as standalone.",
+    "'box' in horse racing betting = 复式 (any order). 'straight' = 直选 (exact order). Example: 'Exacta box' = Exacta复式.",
+    "'pari-mutuel' / 'mutual odds' = 彩池投注/彩池赔率 (NOT 联合赔率投注 which is awkward and non-standard).",
+    "'Pick Three' / 'Pick Four' / 'Pick Five' = 连中三场 / 连中四场 / 连中五场 (NOT 三项选择投注, 四项选择投注, 五项选择投注 which is literal and unnatural).",
+    "Horse racing bet types are established terms — use the glossary translations consistently. Do not invent new translations."
+  ],
+  "asr_errors": {
+    "Winplay Show": "Win/Place/Show (独赢/前二/前三)",
+    "Exactabet": "Exacta bet",
+    "Trifectabet": "Trifecta bet",
+    "Xactabox": "Exacta box",
+    "pick 3": "Pick Three (连中三场)",
+    "pick 4": "Pick Four (连中四场)",
+    "pick 5": "Pick Five (连中五场)"
+  },
+  "brand_names_keep_english": []
+}

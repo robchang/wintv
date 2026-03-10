@@ -1,12 +1,18 @@
+import glob
+import json
 import os
 import re
 import subprocess
 import tempfile
+from collections import defaultdict
+from dataclasses import dataclass, field
+from pathlib import Path
 
 os.environ.setdefault("NUMBA_CACHE_DIR", "/tmp/numba_cache")
 os.environ.setdefault("TORCH_HOME", "/tmp/torch_hub")
 
 import gradio as gr
+import requests
 import soundfile as sf
 import torch
 
@@ -17,13 +23,13 @@ SAMPLE_RATE = 16000
 MAX_NEW_TOKENS = 500
 
 ASR_CHOICES = [
-    "Granite Speech 3.3-8B",
     "Parakeet TDT 0.6B v3",
+    "Granite Speech 3.3-8B",
     "Qwen3-ASR 1.7B",
 ]
 TRANSLATION_CHOICES = [
-    "Granite 3.3-8B (text mode)",
     "Qwen2.5-32B-Instruct",
+    "Granite 3.3-8B (text mode)",
 ]
 
 # Chunk limits per ASR model (seconds). None = no chunking needed.
@@ -41,12 +47,13 @@ GRANITE_SYSTEM_PROMPT = (
 GRANITE_TRANSCRIBE_PROMPT = "<|audio|>Please transcribe the following audio to text."
 GRANITE_TRANSLATE_PROMPT = "<|audio|>translate the speech to Chinese."
 
-# Simple draft translation prompt
+# Simple draft translation prompt (used as fallback for per-sentence 2-pass)
 DRAFT_TRANSLATION_PROMPT = "将以下英文翻译成中文。只输出中文译文。\n\n"
 
-# Full polishing prompt — expects English + draft Chinese
-TRANSLATION_PROMPT = """\
-You are a professional localization editor producing Mandarin Chinese narration for broadcast media.
+# Per-sentence polish prompt (used as fallback when block translation fails)
+# Domain-agnostic: domain rules injected at runtime via {domain_rules}
+SENTENCE_POLISH_PROMPT = """\
+You are a professional localization editor producing Mandarin Chinese subtitles for broadcast media.
 
 INPUT
 You will receive:
@@ -56,71 +63,546 @@ You will receive:
 TASK
 Rewrite the Chinese text so it reads like natural Mandarin television narration while remaining completely faithful to the English meaning.
 
-You may restructure sentences and adjust wording to improve clarity and narration flow, but you must not change, omit, or add information.
+RULES
+- Write as if the script were originally written in Chinese. Avoid 翻译腔.
+- Use 你 throughout (never 您). Casual, approachable tone.
+- Simplified Chinese characters only. Chinese full-width punctuation.
+- Match the energy/tone of the English (upbeat → upbeat, instructional → clear and direct).
+- Keep sentences short and direct — suitable for subtitle reading in 2-3 seconds.
+- Translate numbers, quantities, and odds exactly.
+  "Over a dozen" → "十几个". "Half a dozen" → "六个左右" (≈6, NOT 十几个).
+- Preserve currency context (dollars, not 元, for US contexts).
+- Do NOT translate channel names, brand names, product names, or game titles. Keep them in English
+  unless there is a well-known official Chinese name. When in doubt, keep English.
+- Every other English word must be translated. Never leave untranslated English tokens embedded in
+  Chinese output (except brand names per the rule above).
+- For domain terms without a standard Chinese equivalent, use Chinese + English in parentheses.
+- Use established Mandarin terminology for the relevant domain. Do not invent terms.
+- Do not add or remove information. Do not change factual content.
+- Prefer simple, direct Mandarin rather than promotional or marketing-style wording.
+- Favor clear, everyday phrasing that sounds natural in subtitles.
+- Do not translate English idioms word-for-word. Translate the intended meaning.
+{domain_rules}
+OUTPUT
+Return only the revised Chinese text. No explanations.
+"""
 
-STYLE REQUIREMENTS
+# Block-level translation prompt — translates 5-8 sentences as a paragraph
+# Domain-agnostic: domain rules injected at runtime via {domain_rules}
+BLOCK_TRANSLATION_PROMPT = """\
+You are a professional localization editor producing Mandarin Chinese subtitles for broadcast media.
 
-Natural Mandarin
-- Write as if the script were originally written in Chinese rather than translated from English.
-- Avoid translation-style Chinese (翻译腔).
-- Use natural, idiomatic Mandarin suitable for spoken narration.
-- Prefer clear and concise sentences that sound natural when spoken aloud.
+INPUT
+You will receive numbered English sentences from a TV narration script:
+[1] First sentence.
+[2] Second sentence.
+...
 
-Broadcast Narration Style
-- Ensure the script reads smoothly as a television voiceover.
-- Maintain a clear and engaging narrative flow between sentences.
-- Prefer narration phrasing commonly used in Mandarin broadcast media.
+TASK
+Translate each sentence into natural Mandarin Chinese, preserving the [N] markers exactly.
 
-Chinese-first phrasing
-- Prefer natural Mandarin narration structures rather than mirroring English sentence structure.
-- When the English uses promotional or rhetorical language, express the meaning using natural Mandarin narration instead of translating the rhetoric literally.
+OUTPUT FORMAT
+Return one translated line per input, with the same [N] markers:
+[1] 第一句中文翻译。
+[2] 第二句中文翻译。
 
-Avoid Translation Artifacts
-- Avoid phrasing that resembles literal translation of English marketing or promotional language.
-- Avoid wording typical of interface text, corporate marketing copy, or product descriptions.
-- Prefer straightforward narration language commonly used in Chinese media.
+RULES
+- Output EXACTLY the same number of [N] lines as the input. Never merge, split, or skip lines.
+- Write as if the script were originally written in Chinese. Avoid 翻译腔 (translation-style Chinese).
+- Use 你 throughout (never 您). Casual, approachable tone.
+- Simplified Chinese characters only. Chinese full-width punctuation.
+- Match the energy/tone of the English source (upbeat promo → upbeat Chinese, instructional → clear and direct).
+- Keep each line concise — suitable for subtitle reading in 2-3 seconds.
+- Translate numbers, quantities, and odds exactly as stated.
+  "Over a dozen" → "十几个". "Half a dozen" → "六个左右" (≈6, NOT 十几个).
+- Preserve currency context (dollars, not 元, for US contexts).
+- Do NOT translate channel names, brand names, product names, or game titles. Keep them in English
+  unless there is a well-known official Chinese name. When in doubt, keep English.
+- Every other English word must be translated. Never leave untranslated English tokens embedded in Chinese
+  sentences (except brand names per the rule above).
+- For domain terms without a standard Chinese equivalent, use Chinese + English in parentheses.
+- Use established Mandarin terminology commonly used in the relevant domain. Do not invent terms by literal translation.
+- Use the same Chinese term for the same English term across all lines. Be consistent.
+- Do not add, remove, or change factual information.
+- Prefer simple, direct Mandarin rather than promotional or marketing-style wording.
+- If the English contains promotional language, translate the MEANING using straightforward Mandarin, not the rhetoric.
+- Favor clear, everyday phrasing that sounds natural in subtitles.
+- Do not translate English idioms word-for-word. Translate the intended meaning.
+  Example: "leave the driving to someone else" → 提供接送服务 (not 把驾驶交给别人).
+- When unsure about domain terminology, prefer the most commonly used Mandarin term in that industry.
+- The English transcript may contain ASR errors. Translate the intended word, not the ASR error.
+- If an English sentence is a sentence fragment that continues from the previous line,
+  translate ONLY the fragment — do not incorporate content from other [N] lines.
+{domain_rules}
+OUTPUT
+Return ONLY the numbered Chinese lines. No explanations, notes, or commentary.
+"""
 
-Terminology
-- Use established Mandarin terminology commonly used in the relevant domain.
-- Do not invent new Chinese terms through literal translation.
-- If a specialized concept does not have a widely recognized Chinese equivalent, keep the English term in parentheses and briefly explain it rather than creating a new term.
+# Document-level cleanup prompt
+# Domain-agnostic: domain rules injected at runtime via {domain_rules}
+CLEANUP_PROMPT = """\
+You are a senior localization editor reviewing a complete Mandarin Chinese subtitle script translated from English.
 
-Meaning Fidelity
-- Preserve the exact meaning of the English source.
-- Do not introduce new facts, context, or assumptions.
-- Do not change numbers, rules, distances, time expressions, or relationships described in the original text.
-- If the draft translation contains errors or mistranslations, correct them using the English source.
+INPUT
+You will receive:
+1) The full English transcript with [SEG N] markers (note: it may contain ASR typos)
+2) The full Chinese translation with matching [SEG N] markers
 
-Factual Interpretation
-- Interpret the meaning of the English text carefully before rewriting.
-- Avoid guessing or substituting culturally specific concepts that are not explicitly stated in the English source.
-- When describing transportation, distance, time, or services, ensure the meaning remains logically consistent with the original description.
+TASK
+Review the complete Chinese translation and fix ONLY the following issues:
 
-Avoid Semantic Drift
-- Do not replace literal meanings with idioms or metaphors that alter the meaning.
-- Avoid exaggerated or interpretive language that changes the factual content of the original.
-- Avoid metaphors that change the scale or realism of descriptions.
+1. Terminology Consistency
+Ensure the same English term is translated consistently throughout the document.
 
-Consistency
-- Use consistent terminology throughout the passage.
-- Maintain a coherent broadcast narration tone.
+2. Meaning & Instruction Correctness
+Correct any Chinese that is wrong, misleading, or self-contradictory relative to the intended English meaning.
+Fix incorrect translations even if they appear "literal".
 
-FINAL ALIGNMENT CHECK
+3. ASR Noise Handling (English may be imperfect)
+The English transcript may contain obvious ASR mistakes.
+When a phrase is clearly an ASR error, produce Chinese that matches the intended meaning.
+Do NOT overcorrect — only fix cases that are unambiguous from context.
 
-Before producing the final script:
+4. MT Artifacts
+Fix leftover English tokens, unnatural phrasing, or obvious machine-translation artifacts.
 
-1. Verify each sentence accurately reflects the meaning of the English source.
-2. Ensure no information has been added or removed.
-3. Confirm that numbers, time references, distances, and factual descriptions remain accurate.
-4. Replace any phrasing that sounds like translated English with natural Mandarin narration.
+5. Style Consistency
+Use:
+- Simplified Chinese only
+- 你 only (never 您)
+- Consistent punctuation and formatting
+
+6. Plain Language (Subtitle tone)
+Replace promotional or advertising-style Chinese with clear, direct Mandarin suitable for subtitles.
+Avoid cliché marketing phrasing when a plain equivalent exists.
+
+7. Subtitle Readability
+Prefer concise, natural phrasing suitable for subtitles.
+Shorten awkward or overly literal sentences when possible, while preserving meaning.
+
+8. Terminology Safety
+Do NOT invent new technical terms.
+If a domain-specific term is uncertain, keep the existing translation or retain the English term
+(without adding extra explanations), rather than guessing a new Chinese term.
+
+9. Brand/Product Name Protection
+Do NOT translate channel names, brand names, product names, or game titles.
+Keep them in English unless there is a well-known official Chinese name.
+If a previous segment incorrectly translated a brand name, fix it back to English.
+{domain_rules}
+CONSTRAINTS
+- Preserve ALL [SEG N] markers exactly as given.
+- Output EXACTLY the same number of segments as the input.
+- Keep edits minimal — only fix genuine issues.
+- Do not add or remove information.
+- Do not merge or split segments.
+- NEVER truncate a segment. Each output segment must be a complete translation, not a fragment.
 
 OUTPUT
-
-Return only the final polished Chinese script.
-
-Do not include explanations, notes, or commentary.
-
+Return ONLY the revised Chinese script with [SEG N] markers preserved. No explanations.
 """
+
+# Domain analysis prompt — generates a brief for the cleanup pass
+DOMAIN_BRIEF_PROMPT = """\
+You are a localization consultant. Given the following English transcript from a TV narration, \
+produce a brief domain analysis to help a translation editor.
+
+Respond in this exact format:
+
+DOMAIN: [primary domain, e.g., "casino gambling", "sports", "cooking", "travel"]
+KEY_TERMS: [comma-separated list of domain-specific terms that need precise Chinese equivalents]
+GLOSSARY: [key English term → correct Chinese translation, one per line, up to 10 entries]
+ASR_ERRORS: [common ASR misrecognitions in this domain, e.g., "anti → ante, pear → pair"]
+NOTES: [any content-specific translation pitfalls]
+"""
+
+# Video-specific translation brief prompt — generates tailored guidance
+# from full transcript + KB before translation begins
+TRANSLATION_BRIEF_PROMPT = """\
+You are a senior EN→ZH translation analyst preparing a translation brief for a TV subtitle translator.
+
+You will receive:
+1. A full English transcript (with segment numbers)
+2. A domain knowledge base (glossary, rules, ASR errors, brand names)
+
+Your job: Analyze the transcript and generate a VIDEO-SPECIFIC translation brief that will help the translator avoid errors. This is NOT a generic rulebook — it's tailored analysis of THIS specific content.
+
+Your brief MUST include ALL of these sections:
+
+## CONTENT STRUCTURE
+Identify the major topic sections in the video and their approximate segment ranges.
+Example: "Segments 1-75: Ultimate Texas Hold'em strategy"
+
+## CROSS-CAPTION SPLITS
+CRITICAL: Find sentences that are split across caption boundaries where meaning could be lost.
+Look for segments that end mid-sentence and the next segment continues it.
+For each split, explain what the COMPLETE sentence means so the translator handles both parts correctly.
+Example: "[Seg 86] ends with 'three' [Seg 87] starts with 'of a kind' → together this means 三条 (three of a kind). Do NOT translate seg 87 as 四条."
+
+## AMBIGUOUS TERMS
+Identify English words/phrases that have DIFFERENT translations depending on context in this video.
+For each, specify which translation to use in which segment ranges.
+Example: "'play' = Play注 (specific bet) in poker strategy sections, 玩 (general) in intro sections"
+
+## IDIOMS & COLLOQUIALISMS
+Flag any informal speech, slang, or idioms that could be mistranslated if taken literally.
+Example: "'Who you got?' (seg 200) = 你押谁？ (betting idiom), NOT 你是谁？"
+
+## TERMINOLOGY FOR THIS VIDEO
+List ONLY the glossary terms that actually appear in this transcript, grouped by topic section.
+For terms with special context in this video, add a note.
+
+## WARNINGS
+Any other potential pitfalls specific to this video's content.
+Example: "Three-card poker section (segs 76-105) has NO four-of-a-kind or full house — never use 四条 or 葫芦 in this range."
+
+## SEGMENT-LEVEL CORRECTIONS
+Scan the transcript for segments where the glossary/rules indicate a SPECIFIC translation that could easily be missed or mistranslated. Output a direct correction instruction for each.
+Focus on: context-dependent words (e.g., "play" meaning different things), domain-specific terms that look like common words, and words with non-obvious translations.
+Example: "[Seg 70] 'Joker' here means 鬼牌 (wild card), not 小丑牌 (clown)"
+Example: "[Seg 99] 'play or fold' = 下Play注或弃牌 (Play is the bet name, not 跟注)"
+Example: "[Seg 65] 'play straights in your high hand' = 把顺子放在高牌那手 (play=place, not 打)"
+
+Be thorough and specific. Reference segment numbers. The translator will use this brief to avoid errors."""
+
+# Quality evaluation prompt (used with eval LLM on llama-server)
+EVAL_PROMPT = """\
+You are a strict EN→ZH translation quality auditor for broadcast subtitles.
+{domain_rules}
+Check each EN/ZH pair and classify issues by SEVERITY:
+
+CRITICAL — meaning is WRONG or LOST (auto-fix will re-translate these):
+  - MISTRANSLATION: Chinese conveys a DIFFERENT meaning than English (wrong number, wrong action, wrong subject)
+  - MISALIGNMENT: Chinese text clearly belongs to a different segment / shifted subtitles
+  - TERMINOLOGY: A glossary term is translated WRONG (not just differently worded — actually wrong per the glossary)
+
+MAJOR — content problem but meaning partially preserved:
+  - OMISSION: Significant English content missing from Chinese (not just minor words)
+  - NUMBER_ERROR: A specific number, quantity, or rule logic is wrong
+  - BRAND_ERROR: A brand name was translated when it must stay in English
+
+MINOR — polish only:
+  - STYLE: Chinese sounds noticeably unnatural (only flag if clearly awkward, not wording preferences)
+  - ASR_NOTE: ASR error in source that was correctly handled in translation (informational only)
+
+For each issue found, output ONE line:
+[N] SEVERITY/ISSUE_TYPE: brief description
+
+IMPORTANT — be precise and conservative:
+- CRITICAL means the translation is WRONG, not just imperfect. Use sparingly.
+- If the translation correctly conveys the meaning but uses different wording, that is NOT critical.
+- If an ASR error in the source was CORRECTLY translated (e.g. "anti" → 底注), do NOT flag it as CRITICAL. Use ASR_NOTE at most.
+- Do NOT flag acceptable Chinese for game names: 宾果 (Bingo), 牌九 (Pai Gow) are fine.
+- Do NOT flag style preferences. Only flag STYLE if the Chinese is clearly awkward or ungrammatical.
+- Expect ~0-3 CRITICAL issues per chunk of 15 segments. If you are flagging more, you are being too aggressive.
+- If a chunk has no issues, output: CHUNK_OK
+
+Segments:
+"""
+
+# --- Knowledge Base Directory ---
+
+KNOWLEDGE_DIR = Path(__file__).parent / "knowledge"
+
+
+# --- Domain Context ---
+
+
+@dataclass
+class DomainContext:
+    """Structured domain knowledge for injection into prompts."""
+    domain: str = "general"
+    brief: str = ""  # LLM-generated domain brief
+    glossary: dict[str, str] = field(default_factory=dict)
+    rules: list[str] = field(default_factory=list)
+    asr_errors: dict[str, str] = field(default_factory=dict)
+    brand_names: list[str] = field(default_factory=list)
+
+
+def _load_knowledge_files() -> list[dict]:
+    """Load all JSON knowledge files from the knowledge directory."""
+    if not KNOWLEDGE_DIR.exists():
+        return []
+    files = []
+    for path in sorted(KNOWLEDGE_DIR.glob("*.json")):
+        try:
+            with open(path) as f:
+                files.append(json.load(f))
+        except (json.JSONDecodeError, OSError) as e:
+            print(f"  Warning: failed to load {path}: {e}")
+    return files
+
+
+def _match_knowledge(english_text: str, llm_domain: str) -> list[dict]:
+    """Find knowledge files matching the transcript content or detected domain."""
+    all_kb = _load_knowledge_files()
+    if not all_kb:
+        return []
+
+    text_lower = english_text.lower()
+    matched = []
+    for kb in all_kb:
+        # Match by domain name (fuzzy: check if LLM domain contains the KB domain or vice versa)
+        kb_domain = kb.get("domain", "").lower().replace("_", " ")
+        if kb_domain and (kb_domain in llm_domain.lower() or llm_domain.lower() in kb_domain):
+            matched.append(kb)
+            continue
+        # Match by keyword frequency — require at least 3 keyword hits
+        keywords = kb.get("keywords", [])
+        hits = sum(1 for kw in keywords if kw.lower() in text_lower)
+        if hits >= 3:
+            matched.append(kb)
+    return matched
+
+
+def _parse_domain_from_brief(brief: str) -> str:
+    """Extract the DOMAIN: field from an LLM-generated domain brief."""
+    for line in brief.split("\n"):
+        if line.strip().upper().startswith("DOMAIN:"):
+            return line.split(":", 1)[1].strip().strip('"').strip("'")
+    return "general"
+
+
+def _parse_glossary_from_brief(brief: str) -> dict[str, str]:
+    """Extract GLOSSARY entries from LLM brief. Parses 'English → Chinese' lines."""
+    glossary = {}
+    in_glossary = False
+    for line in brief.split("\n"):
+        stripped = line.strip()
+        if stripped.upper().startswith("GLOSSARY:"):
+            in_glossary = True
+            # Check for inline entries after "GLOSSARY:"
+            rest = stripped.split(":", 1)[1].strip()
+            if rest:
+                # Parse comma-separated entries on same line
+                for entry in rest.split(","):
+                    entry = entry.strip()
+                    for sep in ["→", "->", "=", " - "]:
+                        if sep in entry:
+                            parts = entry.split(sep, 1)
+                            eng = parts[0].strip().strip('"').strip("'")
+                            zh = parts[1].strip().strip('"').strip("'")
+                            if eng and zh:
+                                glossary[eng] = zh
+                            break
+            continue
+        if in_glossary:
+            # Stop at next section header
+            if stripped.upper().startswith(("ASR_ERRORS:", "NOTES:", "KEY_TERMS:", "DOMAIN:")):
+                break
+            for sep in ["→", "->", "=", " - "]:
+                if sep in stripped:
+                    parts = stripped.split(sep, 1)
+                    eng = parts[0].strip().strip("-").strip().strip('"').strip("'")
+                    zh = parts[1].strip().strip('"').strip("'")
+                    if eng and zh:
+                        glossary[eng] = zh
+                    break
+    return glossary
+
+
+def load_domain_knowledge(
+    all_english: list[str], tokenizer, model, device,
+) -> DomainContext:
+    """Detect domain and load matching knowledge. Merges LLM brief with pre-built KB."""
+    # Step 1: LLM domain brief
+    sample = " ".join(all_english)[:2000]
+    brief = _generate_text(tokenizer, model, [
+        {"role": "system", "content": DOMAIN_BRIEF_PROMPT},
+        {"role": "user", "content": sample},
+    ], device=device, max_new_tokens=400).strip()
+
+    llm_domain = _parse_domain_from_brief(brief)
+    print(f"  Domain detected: {llm_domain}")
+
+    ctx = DomainContext(domain=llm_domain, brief=brief)
+
+    # Seed glossary from LLM brief (KB entries will override these)
+    brief_glossary = _parse_glossary_from_brief(brief)
+    if brief_glossary:
+        ctx.glossary.update(brief_glossary)
+        print(f"  Brief glossary: {len(brief_glossary)} entries")
+
+    # Step 2: Match knowledge base files
+    full_text = " ".join(all_english)
+    matched_kbs = _match_knowledge(full_text, llm_domain)
+
+    if matched_kbs:
+        names = [kb.get("display_name", kb.get("domain", "?")) for kb in matched_kbs]
+        print(f"  Knowledge bases loaded: {', '.join(names)}")
+        for kb in matched_kbs:
+            ctx.glossary.update(kb.get("glossary", {}))
+            ctx.rules.extend(kb.get("rules", []))
+            ctx.asr_errors.update(kb.get("asr_errors", {}))
+            ctx.brand_names.extend(kb.get("brand_names_keep_english", []))
+    else:
+        print("  No pre-built knowledge base matched — using LLM brief only")
+
+    return ctx
+
+
+def format_domain_rules(ctx: DomainContext) -> str:
+    """Format DomainContext into a text block for prompt injection."""
+    if not ctx.glossary and not ctx.rules and not ctx.asr_errors and not ctx.brand_names:
+        # No domain knowledge — inject the raw LLM brief as fallback
+        if ctx.brief:
+            return f"\nDOMAIN CONTEXT:\n{ctx.brief}\n"
+        return ""
+
+    parts = [f"\nDOMAIN-SPECIFIC RULES (detected domain: {ctx.domain})\n"]
+
+    if ctx.glossary:
+        parts.append("Terminology Glossary (use these exact translations):")
+        for eng, zh in ctx.glossary.items():
+            parts.append(f"  - {eng} = {zh}")
+        parts.append("")
+
+    if ctx.rules:
+        parts.append("Translation Rules:")
+        for rule in ctx.rules:
+            parts.append(f"  - {rule}")
+        parts.append("")
+
+    if ctx.asr_errors:
+        parts.append("ASR Error Corrections (translate the intended word, not the error):")
+        for error, correction in ctx.asr_errors.items():
+            parts.append(f'  - "{error}" → {correction}')
+        parts.append("")
+
+    if ctx.brand_names:
+        parts.append("Brand/Game Names (keep in English, NEVER translate):")
+        parts.append(f"  - {', '.join(ctx.brand_names)}")
+        parts.append("")
+
+    return "\n".join(parts)
+
+
+def format_domain_rules_for_block(ctx: DomainContext, block_texts: list[str]) -> str:
+    """Format domain rules scoped to a block — only include relevant glossary/ASR entries."""
+    if not ctx or (not ctx.glossary and not ctx.rules and not ctx.asr_errors and not ctx.brand_names):
+        if ctx and ctx.brief:
+            return f"\nDOMAIN CONTEXT:\n{ctx.brief}\n"
+        return ""
+
+    text_lower = " ".join(block_texts).lower()
+
+    # Filter glossary to entries present in this block
+    scoped_glossary = {k: v for k, v in ctx.glossary.items() if k.lower() in text_lower}
+    # If most terms match, just use the full glossary (domain is broadly relevant)
+    if len(scoped_glossary) > len(ctx.glossary) * 0.6:
+        scoped_glossary = ctx.glossary
+
+    # Filter ASR errors to entries present in this block
+    scoped_asr = {k: v for k, v in ctx.asr_errors.items() if k.lower() in text_lower}
+
+    # Scope rules to block content — only include rules mentioning relevant keywords
+    # Rule keywords: extract key English terms from each rule to match against block text
+    RULE_SCOPE_KEYWORDS = {
+        "Pai Gow": ["pai gow", "joker", "high hand", "low hand", "set hand", "split", "five aces", "two pair", "setting your hand", "hand-setting"],
+        "bingo": ["bingo", "hall", "dauber", "caller", "program", "game", "running", "good cause"],
+        "slots": ["slot", "reel", "symbol", "wheel", "spin", "credits", "payline", "split symbol", "double symbol", "full reel", "bonus round", "wheel slice"],
+        "horse racing": ["horse", "racing", "win/place/show", "place", "show", "exacta", "trifecta", "pick three", "pick four", "pick five", "pari-mutuel"],
+        "three card poker": ["three card", "play or fold", "play bet"],
+        "poker": ["check", "call", "raise", "fold", "ante", "hole cards", "four of a kind", "full house", "pair", "community", "flop", "draw", "hand", "medium pair", "high pair", "low pair", "turns over", "dealer turns"],
+        "promo": ["promo", "atmosphere", "plan your", "best place", "our people", "our staff", "everyone", "more play", "more action", "lucky trip", "rely on", "comprehensive guide", "thanks for watching", "thank you for watching", "win more", "tips on", "strategy", "easy to play"],
+        "general": ["brand", "natural", "style", "dozen", "who you got", "translationese"],
+    }
+
+    def _rule_is_relevant(rule: str, block_lower: str) -> bool:
+        """Check if a rule is relevant to the block content."""
+        rule_lower = rule.lower()
+        for category, keywords in RULE_SCOPE_KEYWORDS.items():
+            if any(kw in rule_lower for kw in keywords):
+                # This rule belongs to a category — only include if block mentions it
+                return any(kw in block_lower for kw in keywords)
+        # Rule doesn't match any category — always include (safety net)
+        return True
+
+    scoped_rules = [r for r in ctx.rules if _rule_is_relevant(r, text_lower)]
+
+    parts = [f"\nDOMAIN-SPECIFIC RULES (detected domain: {ctx.domain})\n"]
+
+    if scoped_glossary:
+        parts.append("Terminology Glossary (use these exact translations):")
+        for eng, zh in scoped_glossary.items():
+            parts.append(f"  - {eng} = {zh}")
+        parts.append("")
+
+    if scoped_rules:
+        parts.append("Translation Rules:")
+        for rule in scoped_rules:
+            parts.append(f"  - {rule}")
+        parts.append("")
+
+    if scoped_asr:
+        parts.append("ASR Error Corrections (translate the intended word, not the error):")
+        for error, correction in scoped_asr.items():
+            parts.append(f'  - "{error}" → {correction}')
+        parts.append("")
+
+    if ctx.brand_names:
+        parts.append("Brand/Game Names (keep in English, NEVER translate):")
+        parts.append(f"  - {', '.join(ctx.brand_names)}")
+        parts.append("")
+
+    return "\n".join(parts)
+
+
+def generate_translation_brief(
+    all_english: list[str],
+    domain_ctx: DomainContext,
+    tokenizer, model, device,
+) -> str:
+    """Generate a video-specific translation brief by analyzing the full transcript.
+
+    The brief identifies cross-caption splits, ambiguous terms, idioms, and
+    content structure to help the translator avoid context-dependent errors.
+    Runs once before translation starts (~60-120s).
+    """
+    import time
+    t0 = time.time()
+
+    # Format transcript with segment numbers
+    transcript_lines = [f"[{i+1}] {text}" for i, text in enumerate(all_english)]
+    transcript = "\n".join(transcript_lines)
+
+    # Format KB for the brief generator
+    kb_sections = []
+    if domain_ctx.glossary:
+        kb_sections.append("Glossary:")
+        for eng, zh in domain_ctx.glossary.items():
+            kb_sections.append(f"  {eng} = {zh}")
+    if domain_ctx.rules:
+        kb_sections.append("\nRules:")
+        for rule in domain_ctx.rules:
+            kb_sections.append(f"  - {rule}")
+    if domain_ctx.asr_errors:
+        kb_sections.append("\nASR Errors:")
+        for err, fix in domain_ctx.asr_errors.items():
+            kb_sections.append(f'  "{err}" → {fix}')
+    if domain_ctx.brand_names:
+        kb_sections.append(f"\nBrand Names (keep English): {', '.join(domain_ctx.brand_names)}")
+    kb_text = "\n".join(kb_sections)
+
+    user_msg = f"""TRANSCRIPT ({len(all_english)} segments):
+{transcript}
+
+DOMAIN KNOWLEDGE BASE ({domain_ctx.domain}):
+{kb_text}
+
+Generate the video-specific translation brief now."""
+
+    print(f"  Brief generation: {len(all_english)} segments, ~{len(user_msg)} char prompt")
+
+    brief = _generate_text(tokenizer, model, [
+        {"role": "system", "content": TRANSLATION_BRIEF_PROMPT},
+        {"role": "user", "content": user_msg},
+    ], device=device, max_new_tokens=4096)
+
+    elapsed = time.time() - t0
+    print(f"  Brief generated in {elapsed:.1f}s ({len(brief)} chars)")
+    return brief.strip()
+
 
 # --- Global Model Cache ---
 
@@ -516,10 +998,21 @@ def _group_words_into_subtitles(
 
     flush()
 
+    # Merge orphan fragments (< 3 words) into adjacent segment
+    merged = []
+    for text, s, e in results:
+        word_count = len(text.split())
+        if merged and word_count < 3:
+            # Merge short fragment into previous segment
+            prev_text, prev_s, prev_e = merged[-1]
+            merged[-1] = (prev_text + " " + text, prev_s, e)
+        else:
+            merged.append((text, s, e))
+
     # Add labels
     labeled = []
-    for i, (text, s, e) in enumerate(results):
-        labeled.append((f"Seg {i + 1}/{len(results)}", text, s, e))
+    for i, (text, s, e) in enumerate(merged):
+        labeled.append((f"Seg {i + 1}/{len(merged)}", text, s, e))
     return labeled
 
 
@@ -589,6 +1082,31 @@ def transcribe_qwen_asr(wav_path: str) -> list[tuple[str, str, float | None, flo
 
 # --- Translation Model Loading & Inference ---
 
+TRANSLATION_API_URL = "http://localhost:8082/v1/chat/completions"
+_translation_api_checked = False
+_translation_api_ok = False
+
+
+def _translation_api_available() -> bool:
+    """Check if Qwen2.5-32B llama-server is running on port 8082."""
+    global _translation_api_checked, _translation_api_ok
+    if _translation_api_checked:
+        return _translation_api_ok
+    _translation_api_checked = True
+    try:
+        resp = requests.get("http://localhost:8082/health", timeout=2)
+        _translation_api_ok = resp.status_code == 200
+        if _translation_api_ok:
+            print("  Translation API available on port 8082 (Qwen2.5-32B GGUF)")
+    except (requests.ConnectionError, requests.Timeout):
+        _translation_api_ok = False
+    return _translation_api_ok
+
+
+# Sentinel objects for API mode (no real model loaded)
+_API_TOKENIZER = "API_MODE"
+_API_MODEL = "API_MODE"
+
 
 def _load_granite_translator():
     """Reuse Granite ASR model for text-only translation."""
@@ -598,6 +1116,11 @@ def _load_granite_translator():
 
 
 def _load_qwen_translator():
+    """Load Qwen2.5-32B — prefers llama-server API, falls back to transformers."""
+    # Prefer llama-server API (faster, less memory)
+    if _translation_api_available():
+        return {"tokenizer": _API_TOKENIZER, "model": _API_MODEL}
+
     cached = _get_cached("qwen_translator")
     if cached:
         return cached
@@ -618,21 +1141,43 @@ def _load_qwen_translator():
     }, role="translation")
 
 
-def _generate_text(tokenizer, model, messages, device=None, num_beams=1):
-    """Run text generation with chat messages."""
+def _generate_text_api(messages, max_new_tokens=None):
+    """Generate text via llama-server API on port 8082."""
+    resp = requests.post(
+        TRANSLATION_API_URL,
+        json={
+            "model": "Qwen2.5-32B-Instruct",
+            "messages": messages,
+            "temperature": 0.0,
+            "max_tokens": max_new_tokens or MAX_NEW_TOKENS,
+        },
+        timeout=1800,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    return data["choices"][0]["message"].get("content", "").strip()
+
+
+def _generate_text(tokenizer, model, messages, device=None, num_beams=1,
+                    max_new_tokens=None):
+    """Run text generation with chat messages. Routes to API if in API mode."""
+    # Route to llama-server API if in API mode
+    if tokenizer is _API_TOKENIZER:
+        return _generate_text_api(messages, max_new_tokens)
+
     prompt = tokenizer.apply_chat_template(
         messages, tokenize=False, add_generation_prompt=True
     )
     inputs = tokenizer(prompt, return_tensors="pt").to(device or DEVICE)
     outputs = model.generate(
-        **inputs, max_new_tokens=MAX_NEW_TOKENS,
+        **inputs, max_new_tokens=max_new_tokens or MAX_NEW_TOKENS,
         num_beams=num_beams, do_sample=False,
     )
     n = inputs["input_ids"].shape[-1]
     return tokenizer.batch_decode(outputs[:, n:], skip_special_tokens=True)[0]
 
 
-def translate_granite(english_text: str) -> str:
+def translate_granite(english_text: str, domain_ctx: DomainContext | None = None) -> str:
     """Translate using Granite 8B: draft then polish."""
     m = _load_granite_translator()
     tokenizer, model = m["tokenizer"], m["model"]
@@ -644,18 +1189,20 @@ def translate_granite(english_text: str) -> str:
     draft = clean_translation(draft)
 
     # Pass 2: polish with full prompt
+    domain_rules = format_domain_rules(domain_ctx) if domain_ctx else ""
+    prompt = SENTENCE_POLISH_PROMPT.format(domain_rules=domain_rules)
     user_input = (
         f"English:\n{english_text}\n\n"
         f"Draft Chinese:\n{draft}"
     )
     result = _generate_text(tokenizer, model, [
-        {"role": "system", "content": TRANSLATION_PROMPT},
+        {"role": "system", "content": prompt},
         {"role": "user", "content": user_input},
     ], num_beams=4)
     return clean_translation(result)
 
 
-def translate_qwen(english_text: str) -> str:
+def translate_qwen(english_text: str, domain_ctx: DomainContext | None = None) -> str:
     """Translate using Qwen2.5-32B: draft then polish."""
     m = _load_qwen_translator()
     tokenizer, model = m["tokenizer"], m["model"]
@@ -667,15 +1214,904 @@ def translate_qwen(english_text: str) -> str:
     ], device=device)
 
     # Pass 2: polish with full prompt
+    domain_rules = format_domain_rules(domain_ctx) if domain_ctx else ""
+    prompt = SENTENCE_POLISH_PROMPT.format(domain_rules=domain_rules)
     user_input = (
         f"English:\n{english_text}\n\n"
         f"Draft Chinese:\n{draft}"
     )
     result = _generate_text(tokenizer, model, [
-        {"role": "system", "content": TRANSLATION_PROMPT},
+        {"role": "system", "content": prompt},
         {"role": "user", "content": user_input},
     ], device=device)
     return result.strip()
+
+
+# --- Block-Level Translation ---
+
+
+def _group_segments_into_blocks(
+    asr_results: list[tuple[str, str, float | None, float | None]],
+    target_size: int = 6,
+    max_gap_sec: float = 10.0,
+) -> list[list[tuple[int, str]]]:
+    """Group ASR segments into translation blocks of ~target_size sentences.
+    Prefers breaking at large time gaps between segments.
+    Returns list of blocks, each block = [(segment_index, english_text), ...]."""
+    if not asr_results:
+        return []
+
+    # Find natural break points (large time gaps)
+    break_indices = set()
+    for i in range(1, len(asr_results)):
+        prev_end = asr_results[i - 1][3]  # end time
+        curr_start = asr_results[i][2]  # start time
+        if prev_end is not None and curr_start is not None:
+            gap = curr_start - prev_end
+            if gap >= max_gap_sec:
+                break_indices.add(i)
+
+    blocks = []
+    current_block = []
+    for i, (label, text, start, end) in enumerate(asr_results):
+        if i in break_indices and current_block:
+            blocks.append(current_block)
+            current_block = []
+        current_block.append((i, text))
+        if len(current_block) >= target_size and i + 1 not in break_indices:
+            blocks.append(current_block)
+            current_block = []
+
+    if current_block:
+        blocks.append(current_block)
+
+    return blocks
+
+
+def _parse_block_output(result: str, block: list[tuple[int, str]]) -> dict[int, str]:
+    """Parse [N] markers from block translation output.
+    Returns {segment_index: chinese_text}. Missing segments → empty dict entries."""
+    parsed = {}
+    marker_re = re.compile(r"\[(\d+)\]\s*")
+    current_num = None
+    current_text = []
+
+    for line in result.split("\n"):
+        m = marker_re.match(line)
+        if m:
+            # Save previous
+            if current_num is not None:
+                parsed[current_num] = " ".join(current_text).strip()
+            current_num = int(m.group(1))
+            remainder = marker_re.sub("", line).strip()
+            current_text = [remainder] if remainder else []
+        elif current_num is not None:
+            stripped = line.strip()
+            if stripped:
+                current_text.append(stripped)
+
+    if current_num is not None:
+        parsed[current_num] = " ".join(current_text).strip()
+
+    # Map back to segment indices
+    result_map = {}
+    for block_pos, (seg_idx, _) in enumerate(block):
+        marker_num = block_pos + 1
+        if marker_num in parsed and parsed[marker_num]:
+            result_map[seg_idx] = parsed[marker_num]
+
+    return result_map
+
+
+def _get_translator(translation_model_name: str):
+    """Load and return (tokenizer, model, device) for the active translation model."""
+    if translation_model_name == "Qwen2.5-32B-Instruct":
+        m = _load_qwen_translator()
+        if m["model"] is _API_MODEL:
+            device = None  # API mode, device not needed
+        else:
+            device = m["model"].device
+    else:
+        m = _load_granite_translator()
+        device = None
+    return m["tokenizer"], m["model"], device
+
+
+def _extract_brief_for_segments(brief: str, seg_indices: list[int]) -> str:
+    """Extract portions of the translation brief relevant to a segment range.
+
+    Returns the full brief with a note about which segments are being translated.
+    The brief is compact enough (~2-4KB) to include in full — the LLM benefits
+    from seeing the overall structure even when translating a specific block.
+    """
+    if not brief:
+        return ""
+    seg_start = seg_indices[0] + 1
+    seg_end = seg_indices[-1] + 1
+    return f"You are translating segments {seg_start}-{seg_end}. Pay special attention to any notes about these segments.\n\n{brief}"
+
+
+def translate_block(
+    block: list[tuple[int, str]],
+    translation_model_name: str,
+    domain_ctx: DomainContext | None = None,
+    translation_brief: str = "",
+    extra_context: str = "",
+) -> dict[int, str]:
+    """Translate a block of sentences as a paragraph.
+    Returns {segment_index: chinese_text}.
+    Falls back to per-sentence 2-pass for any segments that fail."""
+    tokenizer, model, device = _get_translator(translation_model_name)
+
+    # Inject domain rules scoped to this block's content
+    block_texts = [text for _, text in block]
+    domain_rules = format_domain_rules_for_block(domain_ctx, block_texts) if domain_ctx else ""
+
+    # Append video-specific brief excerpt relevant to this block's segment range
+    if translation_brief:
+        seg_indices = [idx for idx, _ in block]
+        brief_section = _extract_brief_for_segments(translation_brief, seg_indices)
+        if brief_section:
+            domain_rules += f"\nVIDEO-SPECIFIC BRIEF (for segments {seg_indices[0]+1}-{seg_indices[-1]+1}):\n{brief_section}\n"
+
+    if extra_context:
+        domain_rules += f"\n{extra_context}\n"
+
+    prompt = BLOCK_TRANSLATION_PROMPT.format(domain_rules=domain_rules)
+
+    # Format input with [N] markers
+    input_lines = [f"[{i + 1}] {text}" for i, (_, text) in enumerate(block)]
+    input_text = "\n".join(input_lines)
+
+    # Estimate output tokens: ~2x input char count, min 500
+    est_tokens = max(500, len(input_text) * 2)
+    est_tokens = min(est_tokens, 4096)
+
+    print(f"  Translating block of {len(block)} segments...")
+    result = _generate_text(tokenizer, model, [
+        {"role": "system", "content": prompt},
+        {"role": "user", "content": input_text},
+    ], device=device, max_new_tokens=est_tokens)
+
+    translations = _parse_block_output(result, block)
+
+    # Fall back to per-sentence 2-pass for any missing segments
+    missing = [seg_idx for seg_idx, _ in block if seg_idx not in translations]
+    if missing:
+        print(f"  Block had {len(missing)} unparsed segments, falling back to per-sentence")
+        for seg_idx, text in block:
+            if seg_idx in missing:
+                translations[seg_idx] = _translate_sentence_fallback(
+                    text, tokenizer, model, device, domain_ctx,
+                )
+
+    return translations
+
+
+def _translate_sentence_fallback(
+    english_text: str, tokenizer, model, device,
+    domain_ctx: DomainContext | None = None,
+) -> str:
+    """Per-sentence 2-pass translation (draft → polish). Used as fallback."""
+    # Pass 1: quick draft
+    draft = _generate_text(tokenizer, model, [
+        {"role": "user", "content": DRAFT_TRANSLATION_PROMPT + english_text},
+    ], device=device)
+
+    # Pass 2: polish with domain rules scoped to this sentence
+    domain_rules = format_domain_rules_for_block(domain_ctx, [english_text]) if domain_ctx else ""
+    prompt = SENTENCE_POLISH_PROMPT.format(domain_rules=domain_rules)
+    user_input = (
+        f"English:\n{english_text}\n\n"
+        f"Draft Chinese:\n{draft}"
+    )
+    result = _generate_text(tokenizer, model, [
+        {"role": "system", "content": prompt},
+        {"role": "user", "content": user_input},
+    ], device=device)
+    return result.strip()
+
+
+def _parse_cleanup_result(result: str, offset: int = 0) -> dict[int, str]:
+    """Parse [SEG N] markers from cleanup output. Returns {seg_index: text}."""
+    seg_re = re.compile(r"\[SEG\s+(\d+)\]\s*")
+    cleaned = {}
+    current_seg = None
+    current_text = []
+
+    for line in result.split("\n"):
+        m = seg_re.match(line)
+        if m:
+            if current_seg is not None:
+                cleaned[current_seg] = " ".join(current_text).strip()
+            current_seg = int(m.group(1)) - 1  # SEG N is 1-based, convert to 0-based
+            remainder = seg_re.sub("", line).strip()
+            current_text = [remainder] if remainder else []
+        elif current_seg is not None:
+            stripped = line.strip()
+            if stripped:
+                current_text.append(stripped)
+
+    if current_seg is not None:
+        cleaned[current_seg] = " ".join(current_text).strip()
+
+    return cleaned
+
+
+CLEANUP_CHUNK_SIZE = 50  # segments per cleanup batch
+
+
+def cleanup_translation(
+    all_english: list[str],
+    all_chinese: list[str],
+    translation_model_name: str,
+    domain_ctx: DomainContext | None = None,
+    translation_brief: str = "",
+) -> list[str]:
+    """Document-level consistency pass over the full translation (batched)."""
+    tokenizer, model, device = _get_translator(translation_model_name)
+
+    # Format domain rules for cleanup prompt
+    domain_rules = format_domain_rules(domain_ctx) if domain_ctx else ""
+    if translation_brief:
+        domain_rules += f"\nVIDEO-SPECIFIC TRANSLATION BRIEF:\n{translation_brief}\n"
+    prompt = CLEANUP_PROMPT.format(domain_rules=domain_rules)
+
+    n = len(all_english)
+    all_cleaned = {}
+
+    # Batch cleanup into chunks to avoid timeout on large documents
+    num_chunks = (n + CLEANUP_CHUNK_SIZE - 1) // CLEANUP_CHUNK_SIZE
+    print(f"  Running document cleanup on {n} segments ({num_chunks} chunks of ~{CLEANUP_CHUNK_SIZE})...")
+
+    for chunk_start in range(0, n, CLEANUP_CHUNK_SIZE):
+        chunk_end = min(chunk_start + CLEANUP_CHUNK_SIZE, n)
+        chunk_en = all_english[chunk_start:chunk_end]
+        chunk_zh = all_chinese[chunk_start:chunk_end]
+
+        en_doc = "\n".join(f"[SEG {chunk_start + i + 1}] {t}" for i, t in enumerate(chunk_en))
+        zh_doc = "\n".join(f"[SEG {chunk_start + i + 1}] {t}" for i, t in enumerate(chunk_zh))
+
+        user_input = f"English:\n{en_doc}\n\nChinese:\n{zh_doc}"
+
+        est_tokens = max(1000, len(zh_doc) * 3)
+        est_tokens = min(est_tokens, 8192)
+
+        chunk_label = f"chunk {chunk_start // CLEANUP_CHUNK_SIZE + 1}/{num_chunks} (segs {chunk_start+1}-{chunk_end})"
+        print(f"    Cleanup {chunk_label}...")
+
+        result = _generate_text(tokenizer, model, [
+            {"role": "system", "content": prompt},
+            {"role": "user", "content": user_input},
+        ], device=device, max_new_tokens=est_tokens)
+
+        chunk_cleaned = _parse_cleanup_result(result)
+        all_cleaned.update(chunk_cleaned)
+
+    # Return cleaned list, falling back to original for missing segments
+    return [
+        all_cleaned.get(i, orig).strip() if all_cleaned.get(i, "").strip() else orig
+        for i, orig in enumerate(all_chinese)
+    ]
+
+
+# --- Quality Evaluation (Rule-Based + LLM) ---
+
+EVAL_API_URL = "http://localhost:8081/v1/chat/completions"
+EVAL_CHUNK_SIZE = 15
+
+
+def _eval_llm_available() -> bool:
+    """Check if the eval LLM server is running."""
+    try:
+        resp = requests.get("http://localhost:8081/health", timeout=2)
+        return resp.status_code == 200
+    except (requests.ConnectionError, requests.Timeout):
+        # Fallback: try port 8080
+        try:
+            resp = requests.get("http://localhost:8080/health", timeout=2)
+            if resp.status_code == 200:
+                global EVAL_API_URL
+                EVAL_API_URL = "http://localhost:8080/v1/chat/completions"
+                return True
+        except (requests.ConnectionError, requests.Timeout):
+            pass
+        return False
+
+
+def rule_based_evaluate(
+    all_english: list[str],
+    all_chinese: list[str],
+    domain_ctx: DomainContext | None = None,
+) -> list[dict]:
+    """Deterministic glossary/brand/ASR checks. Returns list of issues."""
+    if not domain_ctx:
+        return []
+
+    issues = []
+
+    # Sort glossary by key length descending (match longest first to avoid
+    # "pair" matching inside "two pair" or "Pair Plus")
+    sorted_glossary = sorted(domain_ctx.glossary.items(), key=lambda x: len(x[0]), reverse=True)
+
+    # Short common English words that are also glossary terms — these produce
+    # massive false positives from substring matching (e.g. "win" in "Win TV",
+    # "bet" in "better", "call" in "called", "place" in "a place where").
+    # Only flag these when the multi-word glossary entry matches, or skip them.
+    # The LLM layer handles contextual checks far better.
+    AMBIGUOUS_SHORT_TERMS = {
+        "win", "bet", "call", "pair", "place", "show", "games", "credits",
+        "raise", "check", "fold", "straight", "flush", "slots",
+    }
+
+    # Build a set of already-matched longer terms per segment to avoid
+    # flagging "pair" when "two pair" or "Pair Plus" already matched.
+    for i, (en, zh) in enumerate(zip(all_english, all_chinese)):
+        en_lower = en.lower()
+        matched_spans = []  # Track character spans already matched by longer terms
+
+        # Glossary term check — longest first
+        for term_en, term_zh in sorted_glossary:
+            term_lower = term_en.lower()
+
+            # Skip ambiguous short terms (1-2 words, all common English)
+            term_words = term_lower.split()
+            if len(term_words) <= 1 and term_lower in AMBIGUOUS_SHORT_TERMS:
+                continue
+
+            # Word-boundary matching: use regex \b for whole-word/phrase match
+            pattern = r'\b' + re.escape(term_lower) + r'\b'
+            match = re.search(pattern, en_lower)
+            if not match:
+                continue
+
+            # Skip if this span is already covered by a longer term match
+            span = (match.start(), match.end())
+            if any(s <= span[0] and e >= span[1] for s, e in matched_spans):
+                continue
+
+            # Handle terms with multiple valid translations (separated by |)
+            valid_translations = [t.strip() for t in term_zh.split("|")]
+            # Also accept partial matches for compound translations like 高牌手(五张牌)
+            # where the translation might use 高牌那手 instead
+            base_translations = []
+            for vt in valid_translations:
+                base_translations.append(vt)
+                # Strip parenthetical clarifiers: 高牌手(五张牌) → also accept 高牌手
+                base = re.sub(r'[（(].+?[）)]', '', vt).strip()
+                has_clarifier = (base != vt)
+                if has_clarifier:
+                    base_translations.append(base)
+                    # For terms WITH clarifiers, also accept the 2-char root
+                    # 高牌手(五张牌) → 高牌手 → 高牌 (matches 高牌那手)
+                    if len(base) >= 3:
+                        base_translations.append(base[:2])
+
+            if not any(bt in zh for bt in base_translations):
+                issues.append({
+                    "segment": i + 1,
+                    "severity": "CRITICAL",
+                    "type": "TERMINOLOGY",
+                    "description": f"'{term_en}' should be '{term_zh}' — not found in ZH output",
+                    "english": en,
+                    "chinese": zh,
+                })
+
+            matched_spans.append(span)
+
+        # Brand name check — word boundary aware
+        for brand in domain_ctx.brand_names:
+            pattern = r'\b' + re.escape(brand.lower()) + r'\b'
+            if re.search(pattern, en_lower) and brand not in zh:
+                issues.append({
+                    "segment": i + 1,
+                    "severity": "MAJOR",
+                    "type": "BRAND_ERROR",
+                    "description": f"'{brand}' should be kept in English but may have been translated",
+                    "english": en,
+                    "chinese": zh,
+                })
+
+        # Omission heuristic
+        if len(en) > 20 and len(zh.strip()) < 3:
+            issues.append({
+                "segment": i + 1,
+                "severity": "MAJOR",
+                "type": "OMISSION",
+                "description": f"English has {len(en)} chars but Chinese is nearly empty",
+                "english": en,
+                "chinese": zh,
+            })
+
+    return issues
+
+
+def quality_evaluate(
+    all_english: list[str],
+    all_chinese: list[str],
+    domain_ctx: DomainContext | None = None,
+) -> list[dict]:
+    """Two-layer evaluation: rule-based + LLM semantic checks."""
+
+    # Layer 1: Rule-based (always runs, instant)
+    rule_issues = rule_based_evaluate(all_english, all_chinese, domain_ctx)
+    if rule_issues:
+        print(f"  Rule-based check: {len(rule_issues)} issues found")
+
+    # Layer 2: LLM semantic eval
+    if not _eval_llm_available():
+        print("  Eval LLM not available, returning rule-based results only")
+        return rule_issues
+
+    domain_rules = format_domain_rules(domain_ctx) if domain_ctx else ""
+    llm_issues = []
+
+    total = len(all_english)
+    for start in range(0, total, EVAL_CHUNK_SIZE):
+        end = min(start + EVAL_CHUNK_SIZE, total)
+        chunk_idx = start // EVAL_CHUNK_SIZE + 1
+        total_chunks = (total + EVAL_CHUNK_SIZE - 1) // EVAL_CHUNK_SIZE
+
+        segments = []
+        for i in range(start, end):
+            segments.append(f"[{i + 1}] EN: {all_english[i]} | ZH: {all_chinese[i]}")
+        segments_text = "\n".join(segments)
+
+        prompt_text = EVAL_PROMPT.format(domain_rules=domain_rules)
+        user_content = prompt_text + segments_text
+
+        try:
+            resp = requests.post(
+                EVAL_API_URL,
+                json={
+                    "model": "eval",
+                    "messages": [{"role": "user", "content": user_content}],
+                    "temperature": 0.3,
+                    "max_tokens": 4096,
+                    "chat_template_kwargs": {"enable_thinking": False},
+                },
+                timeout=300,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            msg = data["choices"][0]["message"]
+            content = (msg.get("content") or "").strip()
+
+            # Log raw response for debugging
+            preview = content[:200].replace('\n', ' ') if content else "(empty)"
+            print(f"  Eval chunk {chunk_idx}/{total_chunks} raw: {preview}...")
+
+            # Parse issues — skip only exact CHUNK_OK
+            if content and content.strip() not in ("ALL_OK", "CHUNK_OK"):
+                for line in content.split("\n"):
+                    # Match: [N] SEVERITY/TYPE: description  or  [N] TYPE: description
+                    m = re.match(r"\[(\d+)\]\s*([A-Z][A-Z_/]+):\s*(.+)", line.strip())
+                    if m:
+                        seg_num = int(m.group(1))
+                        if 1 <= seg_num <= total:
+                            raw_type = m.group(2)
+                            # Parse severity from SEVERITY/TYPE format
+                            parts = raw_type.split("/", 1)
+                            if len(parts) == 2 and parts[0] in ("CRITICAL", "MAJOR", "MINOR"):
+                                severity = parts[0]
+                                issue_type = parts[1]
+                            else:
+                                issue_type = parts[0]
+                                # Infer severity from issue type
+                                if issue_type in ("MISTRANSLATION", "ASR_ERROR", "MISALIGNMENT", "TERMINOLOGY"):
+                                    severity = "CRITICAL"
+                                elif issue_type in ("BRAND_ERROR", "OMISSION", "NUMBER_ERROR"):
+                                    severity = "MAJOR"
+                                else:
+                                    severity = "MINOR"
+                            llm_issues.append({
+                                "segment": seg_num,
+                                "severity": severity,
+                                "type": issue_type,
+                                "description": m.group(3).strip(),
+                                "english": all_english[seg_num - 1],
+                                "chinese": all_chinese[seg_num - 1],
+                            })
+
+            chunk_count = sum(1 for iss in llm_issues if start < iss['segment'] <= end)
+            print(f"  Eval chunk {chunk_idx}/{total_chunks}: {chunk_count} LLM issues")
+
+        except Exception as e:
+            print(f"  Eval chunk {chunk_idx}/{total_chunks} failed: {e}")
+
+    # Merge and deduplicate: rule-based + LLM
+    all_issues = list(rule_issues)
+    seen = {(iss["segment"], iss["type"]) for iss in rule_issues}
+    for iss in llm_issues:
+        key = (iss["segment"], iss["type"])
+        if key not in seen:
+            all_issues.append(iss)
+            seen.add(key)
+
+    all_issues.sort(key=lambda x: x["segment"])
+    print(f"  Total: {len(rule_issues)} rule-based + {len(llm_issues)} LLM = {len(all_issues)} unique issues")
+    return all_issues
+
+
+def format_eval_report(issues: list[dict]) -> str:
+    """Format quality evaluation issues grouped by severity."""
+    if not issues:
+        return "Quality check: No issues found."
+
+    # Count by severity
+    severity_order = ["CRITICAL", "MAJOR", "MINOR"]
+    by_severity = {s: [] for s in severity_order}
+    for iss in issues:
+        sev = iss.get("severity", "MINOR")
+        by_severity.setdefault(sev, []).append(iss)
+
+    counts = {s: len(v) for s, v in by_severity.items() if v}
+    summary = ", ".join(f"{v} {k.lower()}" for k, v in counts.items())
+    lines = [f"Quality check: {len(issues)} issues ({summary})\n"]
+
+    for severity in severity_order:
+        sev_issues = by_severity.get(severity, [])
+        if not sev_issues:
+            continue
+        lines.append(f"{'='*50}")
+        lines.append(f"  {severity} ({len(sev_issues)} issues)")
+        lines.append(f"{'='*50}\n")
+        for iss in sev_issues:
+            lines.append(
+                f"[SEG {iss['segment']}] {iss['type']}: {iss['description']}\n"
+                f"  EN: {iss['english']}\n"
+                f"  ZH: {iss['chinese']}\n"
+            )
+
+    return "\n".join(lines)
+
+
+# --- Fix Critical Issues Pass ---
+
+
+def fix_critical_segments(
+    critical_issues: list[dict],
+    all_english: list[str],
+    all_translations: list[str],
+    translation_model_name: str,
+    domain_ctx: DomainContext | None = None,
+    translation_brief: str = "",
+) -> tuple[dict[int, str], list[dict]]:
+    """Re-translate segments with CRITICAL issues, injecting error context.
+    Returns (fixes_dict, comparison_records).
+    Caps at 20 segments to avoid re-translating most of the document."""
+    MAX_FIX_SEGMENTS = 20
+
+    # Group issues by segment index (0-based)
+    issues_by_seg = defaultdict(list)
+    for iss in critical_issues:
+        seg_idx = iss["segment"] - 1  # Convert to 0-based
+        issues_by_seg[seg_idx].append(iss)
+
+    if len(issues_by_seg) > MAX_FIX_SEGMENTS:
+        # Prioritize by issue type severity, then by segment order
+        TYPE_PRIORITY = {
+            "MISTRANSLATION": 0, "MISALIGNMENT": 0,
+            "TERMINOLOGY": 1,
+            "NUMBER_ERROR": 2, "OMISSION": 2,
+            "ASR_ERROR": 3,
+            "BRAND_ERROR": 4,
+            "STYLE": 5,
+        }
+
+        def _seg_priority(seg_idx):
+            """Lower = higher priority. Best issue type in the segment wins."""
+            issues = issues_by_seg[seg_idx]
+            best = min(TYPE_PRIORITY.get(iss["type"], 5) for iss in issues)
+            return (best, seg_idx)
+
+        ranked = sorted(issues_by_seg.keys(), key=_seg_priority)
+        kept_segs = ranked[:MAX_FIX_SEGMENTS]
+        skipped = len(issues_by_seg) - MAX_FIX_SEGMENTS
+        print(f"  WARNING: {len(issues_by_seg)} critical segments exceeds cap of {MAX_FIX_SEGMENTS}, "
+              f"prioritized by type, skipping {skipped} lower-priority segments")
+        issues_by_seg = defaultdict(list, {k: issues_by_seg[k] for k in kept_segs})
+
+    # Build fix guidance
+    guidance_lines = [
+        "CRITICAL ERRORS TO FIX — re-translate these segments to correct the specific errors:"
+    ]
+    for seg_idx in sorted(issues_by_seg):
+        for iss in issues_by_seg[seg_idx]:
+            guidance_lines.append(
+                f"[SEG {seg_idx + 1}] {iss['type']}: {iss['description']}"
+            )
+    fix_guidance = "\n".join(guidance_lines)
+
+    # Build block of affected segments
+    block = [(seg_idx, all_english[seg_idx]) for seg_idx in sorted(issues_by_seg)]
+
+    print(f"  Re-translating {len(block)} segments with error guidance...")
+    fixes = translate_block(
+        block, translation_model_name, domain_ctx, translation_brief,
+        extra_context=fix_guidance,
+    )
+
+    # Build comparison records
+    comparisons = []
+    for seg_idx in sorted(issues_by_seg):
+        new_zh = fixes.get(seg_idx, all_translations[seg_idx])
+        errors = "; ".join(
+            f"{iss['type']}: {iss['description']}" for iss in issues_by_seg[seg_idx]
+        )
+        comparisons.append({
+            "segment": seg_idx + 1,
+            "english": all_english[seg_idx],
+            "before": all_translations[seg_idx],
+            "after": new_zh,
+            "errors": errors,
+        })
+
+    return fixes, comparisons
+
+
+def format_fix_comparison(comparisons: list[dict]) -> str:
+    """Format before/after comparison for auto-fixed segments."""
+    if not comparisons:
+        return ""
+
+    changed = [c for c in comparisons if c["before"] != c["after"]]
+    unchanged = [c for c in comparisons if c["before"] == c["after"]]
+
+    lines = [
+        f"{'='*50}",
+        f"  AUTO-FIXED CRITICAL ISSUES ({len(changed)} of {len(comparisons)} segments changed)",
+        f"{'='*50}",
+        "",
+    ]
+    for comp in changed:
+        lines.append(f"[SEG {comp['segment']}] {comp['errors']}")
+        lines.append(f"  EN:     {comp['english']}")
+        lines.append(f"  BEFORE: {comp['before']}")
+        lines.append(f"  AFTER:  {comp['after']}")
+        lines.append("")
+
+    if unchanged:
+        lines.append(f"  ({len(unchanged)} segments unchanged after re-translation)")
+
+    return "\n".join(lines)
+
+
+# --- Feedback-to-KB Pipeline ---
+
+
+FEEDBACK_ANALYSIS_PROMPT = """\
+Analyze these translation corrections from a cleanup pass. For each, classify as:
+- GLOSSARY: A domain term was retranslated consistently → output English term and correct Chinese
+- ASR_FIX: An ASR transcription error was corrected → output the misheard text and what it should be
+- RULE: A recurring translation pattern that should apply to ALL future translations of this type.
+  Only output RULE for GENERALIZABLE patterns, not one-off fixes.
+  Write the rule as a specific, actionable instruction (what TO do, not what went wrong).
+- STYLE: Stylistic improvement (no knowledge base update needed)
+- ERROR_FIX: A one-off translation error fix (no knowledge base update needed)
+
+Output format (one per line):
+[N] GLOSSARY: english_term = chinese_translation
+[N] ASR_FIX: "misheard" → correct_text
+[N] RULE: description of the translation rule
+[N] STYLE: description
+[N] ERROR_FIX: description
+
+If no corrections need knowledge base updates, output: NO_KB_UPDATES
+"""
+
+
+def _save_learned_kb(domain: str, glossary: dict, asr_errors: dict, rules: list) -> str | None:
+    """Save or update a learned KB file. Returns filename if written."""
+    if not glossary and not asr_errors and not rules:
+        return None
+
+    KNOWLEDGE_DIR.mkdir(exist_ok=True)
+    # Normalize domain name for filename
+    domain_slug = domain.lower().replace(" ", "_").replace("-", "_")
+    path = KNOWLEDGE_DIR / f"{domain_slug}_learned.json"
+
+    # Load existing learned KB if present
+    existing = {}
+    if path.exists():
+        try:
+            with open(path) as f:
+                existing = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    # Merge — never overwrite existing entries
+    ex_glossary = existing.get("glossary", {})
+    for k, v in glossary.items():
+        if k not in ex_glossary:
+            ex_glossary[k] = v
+
+    ex_asr = existing.get("asr_errors", {})
+    for k, v in asr_errors.items():
+        if k not in ex_asr:
+            ex_asr[k] = v
+
+    ex_rules = existing.get("rules", [])
+    for rule in rules:
+        # Deduplicate by checking if key terms overlap
+        if not any(rule[:20] in r for r in ex_rules):
+            ex_rules.append(rule)
+
+    source_runs = existing.get("_meta", {}).get("source_runs", 0) + 1
+    from datetime import date
+    today = date.today().isoformat()
+
+    learned = {
+        "domain": domain_slug,
+        "display_name": f"{domain.title()} (Learned)",
+        "_meta": {
+            "created": existing.get("_meta", {}).get("created", today),
+            "last_updated": today,
+            "source_runs": source_runs,
+        },
+        "keywords": existing.get("keywords", []),
+        "glossary": ex_glossary,
+        "rules": ex_rules,
+        "asr_errors": ex_asr,
+        "brand_names_keep_english": existing.get("brand_names_keep_english", []),
+    }
+
+    with open(path, "w") as f:
+        json.dump(learned, f, ensure_ascii=False, indent=2)
+
+    return path.name
+
+
+def _extract_rules_from_fix_comparisons(
+    comparisons: list[dict],
+    eval_issues: list[dict],
+) -> list[str]:
+    """Extract generalizable translation rules from auto-fix comparisons.
+
+    Looks at CRITICAL issues that were successfully fixed and generates
+    rules that would prevent the same class of error in future translations.
+    """
+    rules = []
+    # Group issues by type to find recurring patterns
+    issues_by_type = defaultdict(list)
+    for comp in comparisons:
+        if comp["before"] == comp["after"]:
+            continue  # Fix didn't change anything
+        for error_line in comp["errors"].split("; "):
+            # Parse "TYPE: description"
+            if ":" in error_line:
+                etype, desc = error_line.split(":", 1)
+                etype = etype.strip()
+                desc = desc.strip()
+                issues_by_type[etype].append({
+                    "english": comp["english"],
+                    "before": comp["before"],
+                    "after": comp["after"],
+                    "description": desc,
+                })
+
+    for etype, instances in issues_by_type.items():
+        if len(instances) < 2:
+            continue  # Need at least 2 instances to call it a pattern
+
+        if etype == "TERMINOLOGY":
+            # Multiple terminology fixes of the same kind → rule
+            # Group by the term being corrected
+            for inst in instances:
+                desc = inst["description"]
+                # Already captured as glossary entries, skip
+                continue
+
+        elif etype == "MISTRANSLATION":
+            # Look for common patterns in what went wrong
+            rule = (
+                f"Recurring mistranslation pattern: when translating content like "
+                f"'{instances[0]['english']}', the model produced '{instances[0]['before']}' "
+                f"but should have produced '{instances[0]['after']}'. "
+                f"Found {len(instances)} similar cases."
+            )
+            rules.append(rule)
+
+        elif etype == "NUMBER_ERROR":
+            rules.append(
+                f"Number accuracy: found {len(instances)} cases where numbers/quantities "
+                f"were incorrectly translated. Always preserve exact numbers from English source."
+            )
+
+    return rules
+
+
+def update_knowledge_from_feedback(
+    domain_ctx: DomainContext,
+    all_english: list[str],
+    pre_cleanup: list[str],
+    post_cleanup: list[str],
+    eval_issues: list[dict],
+    tokenizer, model, device,
+    fix_comparisons: list[dict] | None = None,
+) -> str | None:
+    """Analyze cleanup diffs + eval flags + fix comparisons and update learned KB."""
+    # Collect cleanup diffs
+    diffs = []
+    for i, (pre, post) in enumerate(zip(pre_cleanup, post_cleanup)):
+        if pre != post:
+            diffs.append((i, all_english[i], pre, post))
+
+    if not diffs and not eval_issues and not fix_comparisons:
+        print("  No feedback to analyze (no cleanup changes, no eval flags, no fixes)")
+        return None
+
+    new_glossary = {}
+    new_asr_errors = {}
+    new_rules = []
+
+    # Analyze cleanup diffs via LLM
+    if diffs:
+        diff_lines = []
+        for idx, en, before, after in diffs:
+            diff_lines.append(f"[{idx+1}] EN: {en} | Before: {before} | After: {after}")
+        diff_text = "\n".join(diff_lines)
+
+        result = _generate_text(tokenizer, model, [
+            {"role": "system", "content": FEEDBACK_ANALYSIS_PROMPT},
+            {"role": "user", "content": diff_text},
+        ], device=device, max_new_tokens=500).strip()
+
+        if "NO_KB_UPDATES" not in result:
+            for line in result.split("\n"):
+                line = line.strip()
+                m = re.match(r"\[\d+\]\s*(GLOSSARY):\s*(.+?)\s*=\s*(.+)", line)
+                if m:
+                    eng = m.group(2).strip().strip('"').strip("'")
+                    zh = m.group(3).strip().strip('"').strip("'")
+                    if eng and zh and eng not in domain_ctx.glossary:
+                        new_glossary[eng] = zh
+                    continue
+                m = re.match(r'\[\d+\]\s*(ASR_FIX):\s*["\']?(.+?)["\']?\s*→\s*(.+)', line)
+                if m:
+                    error = m.group(2).strip()
+                    correction = m.group(3).strip()
+                    if error and correction and error not in domain_ctx.asr_errors:
+                        new_asr_errors[error] = correction
+                    continue
+                m = re.match(r'\[\d+\]\s*RULE:\s*(.+)', line)
+                if m:
+                    rule_text = m.group(1).strip()
+                    if len(rule_text) > 15:  # Skip trivially short "rules"
+                        new_rules.append(rule_text)
+
+    # Extract from eval flags
+    for issue in eval_issues:
+        if issue["type"] == "TERMINOLOGY":
+            # Try to extract term=translation from description
+            desc = issue["description"]
+            for sep in ["→", "->", "=", "should be"]:
+                if sep in desc:
+                    parts = desc.split(sep, 1)
+                    eng = parts[0].strip().strip('"').strip("'")
+                    zh = parts[1].strip().strip('"').strip("'")
+                    if eng and zh and eng not in domain_ctx.glossary and eng not in new_glossary:
+                        new_glossary[eng] = zh
+                    break
+
+    # Extract rules from auto-fix comparisons (patterns that recur across fixes)
+    if fix_comparisons:
+        fix_rules = _extract_rules_from_fix_comparisons(fix_comparisons, eval_issues)
+        for rule in fix_rules:
+            # Deduplicate against existing rules
+            if not any(rule[:20] in r for r in domain_ctx.rules):
+                if not any(rule[:20] in r for r in new_rules):
+                    new_rules.append(rule)
+
+    # Save learned KB
+    filename = _save_learned_kb(domain_ctx.domain, new_glossary, new_asr_errors, new_rules)
+    if filename:
+        total = len(new_glossary) + len(new_asr_errors) + len(new_rules)
+        print(f"  Feedback → {filename}: {len(new_glossary)} glossary, "
+              f"{len(new_asr_errors)} ASR errors, {len(new_rules)} rules")
+    else:
+        print("  Feedback analysis found no new KB entries")
+    return filename
 
 
 # --- SRT Helpers ---
@@ -723,13 +2159,21 @@ def process_audio(
     asr_model_name: str,
     translation_model_name: str,
     use_direct_ast: bool,
+    use_cleanup: bool,
+    use_quality_eval: bool,
 ):
-    """Full pipeline: preprocess, transcribe, translate, yield progressive results."""
+    """Full pipeline: preprocess, transcribe, translate, yield progressive results.
+    Yields tuples of (transcription, translation, raw, status, en_srt, zh_srt, quality_report).
+    """
     if audio_path is None:
         raise gr.Error("Please upload an audio file first.")
 
+    def _yield(transcription="", translation="", raw="", status="",
+               en_srt=None, zh_srt=None, quality=""):
+        return (transcription, translation, raw, status, en_srt, zh_srt, quality)
+
     try:
-        yield ("", "", "", "Preprocessing audio...", None, None)
+        yield _yield(status="Preprocessing audio...")
         wav_path = preprocess_to_wav(audio_path)
 
         data, _ = sf.read(wav_path, dtype="float32")
@@ -742,61 +2186,100 @@ def process_audio(
 
         # --- Direct AST path (Granite only) ---
         if use_direct_ast and asr_model_name == "Granite Speech 3.3-8B":
-            yield ("", "", "", "Loading Granite model...", None, None)
+            yield _yield(status="Loading Granite model...")
             chunks = transcribe_granite_ast(wav_path)
             all_translations = []
             all_raw = []
             for i, (label, text, _, _) in enumerate(chunks):
                 all_translations.append(text)
                 all_raw.append(f"[{label}]\n{text}")
-                yield (
-                    "(Direct AST — no separate transcription)",
-                    " ".join(all_translations),
-                    "\n---\n".join(all_raw),
-                    f"AST {label} done.",
-                    None, None,
+                yield _yield(
+                    transcription="(Direct AST — no separate transcription)",
+                    translation=" ".join(all_translations),
+                    raw="\n---\n".join(all_raw),
+                    status=f"AST {label} done.",
                 )
-            yield (
-                "(Direct AST — no separate transcription)",
-                " ".join(all_translations),
-                "\n---\n".join(all_raw),
-                f"Done! Processed {len(chunks)} chunk(s) via direct AST.",
-                None, None,
+            yield _yield(
+                transcription="(Direct AST — no separate transcription)",
+                translation=" ".join(all_translations),
+                raw="\n---\n".join(all_raw),
+                status=f"Done! Processed {len(chunks)} chunk(s) via direct AST.",
             )
             os.unlink(wav_path)
             return
 
-        # --- Two-step: ASR then Translation ---
-        yield ("", "", "", f"Loading {asr_model_name}...", None, None)
+        # --- Two-step: ASR then Block Translation ---
+        yield _yield(status=f"Loading {asr_model_name}...")
         transcribe_fn = ASR_DISPATCH[asr_model_name]
-        translate_fn = TRANSLATE_DISPATCH[translation_model_name]
 
-        yield ("", "", "", f"Transcribing with {asr_model_name}...", None, None)
+        yield _yield(status=f"Transcribing with {asr_model_name}...")
         asr_results = transcribe_fn(wav_path)
 
-        all_transcriptions = []
-        all_translations = []
-        all_raw = []
-        srt_en_entries = []  # (start, end, english_text)
-        srt_zh_entries = []  # (start, end, chinese_text)
+        all_transcriptions = [text for _, text, _, _ in asr_results]
+        all_translations = [""] * len(asr_results)
 
-        for i, (label, transcription, start, end) in enumerate(asr_results):
-            all_transcriptions.append(transcription)
+        # --- Domain Detection ---
+        yield _yield(
+            transcription=" ".join(all_transcriptions),
+            status="Detecting domain and loading knowledge...",
+        )
+        tokenizer, model, device = _get_translator(translation_model_name)
+        domain_ctx = load_domain_knowledge(all_transcriptions, tokenizer, model, device)
+        print(f"  Domain context: {domain_ctx.domain}, "
+              f"{len(domain_ctx.glossary)} glossary entries, "
+              f"{len(domain_ctx.rules)} rules")
 
-            yield (
-                " ".join(all_transcriptions),
-                " ".join(all_translations),
-                "\n---\n".join(all_raw),
-                f"Translating {label} with {translation_model_name}...",
-                None, None,
+        # --- Generate Translation Brief ---
+        yield _yield(
+            transcription=" ".join(all_transcriptions),
+            status="Generating video-specific translation brief...",
+        )
+        translation_brief = generate_translation_brief(
+            all_transcriptions, domain_ctx, tokenizer, model, device,
+        )
+
+        # --- Translate in paragraph blocks ---
+        blocks = _group_segments_into_blocks(asr_results)
+        print(f"  Grouped {len(asr_results)} segments into {len(blocks)} translation blocks")
+
+        for block_idx, block in enumerate(blocks):
+            seg_range = f"segs {block[0][0]+1}-{block[-1][0]+1}"
+            yield _yield(
+                transcription=" ".join(all_transcriptions),
+                translation=" ".join(t for t in all_translations if t),
+                status=f"Translating block {block_idx+1}/{len(blocks)} ({seg_range})...",
             )
 
-            translation = translate_fn(transcription)
-            translation = translation.strip()
+            results = translate_block(block, translation_model_name, domain_ctx, translation_brief)
+            for seg_idx, chinese in results.items():
+                all_translations[seg_idx] = chinese
 
-            all_translations.append(translation)
+            yield _yield(
+                transcription=" ".join(all_transcriptions),
+                translation=" ".join(t for t in all_translations if t),
+                status=f"Block {block_idx+1}/{len(blocks)} done.",
+            )
 
-            # Build raw output with timecodes when available
+        # --- Document-level cleanup pass ---
+        pre_cleanup = list(all_translations)
+        if use_cleanup and len(asr_results) > 1:
+            yield _yield(
+                transcription=" ".join(all_transcriptions),
+                translation=" ".join(t for t in all_translations if t),
+                status="Running document consistency cleanup...",
+            )
+            cleaned = cleanup_translation(
+                all_transcriptions, all_translations,
+                translation_model_name, domain_ctx, translation_brief,
+            )
+            all_translations = cleaned
+
+        # --- Build raw output and SRT entries ---
+        all_raw = []
+        srt_en_entries = []
+        srt_zh_entries = []
+        for i, (label, transcription, start, end) in enumerate(asr_results):
+            translation = all_translations[i]
             if start is not None and end is not None:
                 tc = f"[{_fmt_srt_time(start)} → {_fmt_srt_time(end)}]"
                 all_raw.append(
@@ -812,14 +2295,6 @@ def process_audio(
                     f"EN: {transcription}\n"
                     f"ZH: {translation}"
                 )
-
-            yield (
-                " ".join(all_transcriptions),
-                " ".join(all_translations),
-                "\n---\n".join(all_raw),
-                f"{label} done.",
-                None, None,
-            )
 
         # Generate SRT files if we have timestamps
         en_srt_path = None
@@ -841,13 +2316,90 @@ def process_audio(
             zh_tmp.close()
             zh_srt_path = zh_tmp.name
 
-        yield (
-            " ".join(all_transcriptions),
-            " ".join(all_translations),
-            "\n---\n".join(all_raw),
-            f"Done! {len(asr_results)} chunk(s) — "
-            f"ASR: {asr_model_name}, Translation: {translation_model_name}",
-            en_srt_path, zh_srt_path,
+        # --- Quality Evaluation ---
+        quality_report = ""
+        eval_issues = []
+        if use_quality_eval:
+            yield _yield(
+                transcription=" ".join(all_transcriptions),
+                translation=" ".join(t for t in all_translations if t),
+                raw="\n---\n".join(all_raw),
+                status="Running quality evaluation...",
+                en_srt=en_srt_path, zh_srt=zh_srt_path,
+            )
+            eval_issues = quality_evaluate(all_transcriptions, all_translations, domain_ctx)
+            quality_report = format_eval_report(eval_issues)
+
+            # --- Fix Critical Issues ---
+            fix_comparisons = []
+            critical_issues = [iss for iss in eval_issues if iss.get("severity") == "CRITICAL"]
+            if critical_issues:
+                yield _yield(
+                    transcription=" ".join(all_transcriptions),
+                    translation=" ".join(t for t in all_translations if t),
+                    raw="\n---\n".join(all_raw),
+                    status=f"Fixing {len(critical_issues)} critical issues...",
+                    en_srt=en_srt_path, zh_srt=zh_srt_path,
+                    quality=quality_report,
+                )
+                fixes, fix_comparisons = fix_critical_segments(
+                    critical_issues, all_transcriptions, all_translations,
+                    translation_model_name, domain_ctx, translation_brief,
+                )
+                # Apply fixes
+                for seg_idx, new_zh in fixes.items():
+                    all_translations[seg_idx] = new_zh
+
+                # Rebuild raw output for affected segments
+                for seg_idx in fixes:
+                    label, transcription, start, end = asr_results[seg_idx]
+                    translation = all_translations[seg_idx]
+                    if start is not None and end is not None:
+                        tc = f"[{_fmt_srt_time(start)} → {_fmt_srt_time(end)}]"
+                        all_raw[seg_idx] = f"{tc}\nEN: {transcription}\nZH: {translation}"
+                    else:
+                        all_raw[seg_idx] = f"[{label}]\nEN: {transcription}\nZH: {translation}"
+
+                # Regenerate ZH SRT with fixed translations
+                if srt_zh_entries and zh_srt_path:
+                    srt_zh_entries = [
+                        (s, e, all_translations[i])
+                        for i, (s, e, _) in enumerate(srt_zh_entries)
+                    ]
+                    zh_srt = generate_srt(srt_zh_entries)
+                    with open(zh_srt_path, "w") as f:
+                        f.write(zh_srt)
+
+                # Append comparison to quality report
+                comparison_text = format_fix_comparison(fix_comparisons)
+                if comparison_text:
+                    quality_report += "\n\n" + comparison_text
+
+        # --- Feedback-to-KB (learn from corrections) ---
+        try:
+            tokenizer, model, device = _get_translator(translation_model_name)
+            kb_file = update_knowledge_from_feedback(
+                domain_ctx, all_transcriptions,
+                pre_cleanup, all_translations,
+                eval_issues, tokenizer, model, device,
+                fix_comparisons=fix_comparisons if fix_comparisons else None,
+            )
+            if kb_file:
+                quality_report += f"\n\nKB updated: {kb_file}"
+        except Exception as e:
+            print(f"  Feedback-to-KB failed (non-blocking): {e}")
+
+        yield _yield(
+            transcription=" ".join(all_transcriptions),
+            translation=" ".join(t for t in all_translations if t),
+            raw="\n---\n".join(all_raw),
+            status=(
+                f"Done! {len(asr_results)} segments in {len(blocks)} blocks — "
+                f"ASR: {asr_model_name}, Translation: {translation_model_name}, "
+                f"Domain: {domain_ctx.domain}"
+            ),
+            en_srt=en_srt_path, zh_srt=zh_srt_path,
+            quality=quality_report,
         )
 
         os.unlink(wav_path)
@@ -856,6 +2408,83 @@ def process_audio(
         raise
     except Exception as e:
         raise gr.Error(f"Processing failed: {e}")
+
+
+# --- Knowledge Base Management ---
+
+
+def inspect_knowledge_bases() -> str:
+    """Format a summary of all loaded knowledge base files."""
+    if not KNOWLEDGE_DIR.exists():
+        return "No knowledge directory found."
+
+    paths = sorted(KNOWLEDGE_DIR.glob("*.json"))
+    if not paths:
+        return "No knowledge base files found."
+
+    lines = []
+    for path in paths:
+        is_learned = "_learned" in path.stem
+        tag = "auto-learned" if is_learned else "hand-curated"
+        try:
+            with open(path) as f:
+                kb = json.load(f)
+        except (json.JSONDecodeError, OSError) as e:
+            lines.append(f"=== {path.name} (ERROR: {e}) ===\n")
+            continue
+
+        lines.append(f"=== {path.name} ({tag}) ===")
+        lines.append(f"  Domain: {kb.get('display_name', kb.get('domain', '?'))}")
+
+        glossary = kb.get("glossary", {})
+        if glossary:
+            preview = ", ".join(f"{k}={v}" for k, v in list(glossary.items())[:5])
+            if len(glossary) > 5:
+                preview += ", ..."
+            lines.append(f"  Glossary: {len(glossary)} entries ({preview})")
+        else:
+            lines.append("  Glossary: 0 entries")
+
+        lines.append(f"  Rules: {len(kb.get('rules', []))}")
+        lines.append(f"  ASR Errors: {len(kb.get('asr_errors', {}))}")
+
+        brands = kb.get("brand_names_keep_english", [])
+        if brands:
+            lines.append(f"  Brand Names: {', '.join(brands)}")
+
+        meta = kb.get("_meta", {})
+        if meta:
+            lines.append(f"  Last updated: {meta.get('last_updated', '?')}, "
+                         f"Source runs: {meta.get('source_runs', '?')}")
+
+        lines.append("")
+
+    return "\n".join(lines).strip()
+
+
+def list_learned_kb_files() -> list[str]:
+    """List filenames of auto-learned KB files."""
+    if not KNOWLEDGE_DIR.exists():
+        return []
+    return [p.name for p in sorted(KNOWLEDGE_DIR.glob("*_learned.json"))]
+
+
+def delete_learned_kbs(selected_files: list[str]) -> tuple[str, gr.update]:
+    """Delete selected learned KB files. Returns updated inspector + dropdown."""
+    if not selected_files:
+        return inspect_knowledge_bases(), gr.update(choices=list_learned_kb_files())
+
+    deleted = []
+    for fname in selected_files:
+        if "_learned" not in fname:
+            continue  # safety: never delete hand-curated files
+        path = KNOWLEDGE_DIR / fname
+        if path.exists():
+            path.unlink()
+            deleted.append(fname)
+
+    status = f"Deleted: {', '.join(deleted)}\n\n" if deleted else ""
+    return status + inspect_knowledge_bases(), gr.update(choices=list_learned_kb_files())
 
 
 # --- Gradio UI ---
@@ -893,6 +2522,18 @@ with gr.Blocks(title="English Audio → Mandarin Chinese") as demo:
         visible=True,
     )
 
+    with gr.Row():
+        use_cleanup = gr.Checkbox(
+            label="Document-level consistency cleanup",
+            info="Reviews full translation for terminology consistency and narrative flow.",
+            value=True,
+        )
+        use_quality_eval = gr.Checkbox(
+            label="Quality scoring",
+            info="Two-layer quality evaluation: rule-based checks + LLM review (requires llama-server on port 8081).",
+            value=False,
+        )
+
     submit_btn = gr.Button("Transcribe & Translate", variant="primary")
 
     with gr.Row():
@@ -924,6 +2565,42 @@ with gr.Blocks(title="English Audio → Mandarin Chinese") as demo:
         en_srt_output = gr.File(label="Download English SRT")
         zh_srt_output = gr.File(label="Download Chinese SRT")
 
+    quality_output = gr.Textbox(
+        label="Quality Report",
+        lines=6,
+        visible=True,
+    )
+
+    with gr.Accordion("Knowledge Base Settings", open=False):
+        kb_inspector = gr.Textbox(
+            label="Loaded Knowledge Bases",
+            value=inspect_knowledge_bases(),
+            lines=12,
+            interactive=False,
+        )
+        kb_refresh_btn = gr.Button("Refresh", size="sm")
+
+        with gr.Row():
+            kb_learned_dropdown = gr.Dropdown(
+                choices=list_learned_kb_files(),
+                label="Learned KB files (select to delete)",
+                multiselect=True,
+            )
+            kb_delete_btn = gr.Button(
+                "Delete Selected", variant="stop", size="sm",
+            )
+
+        kb_refresh_btn.click(
+            fn=lambda: (inspect_knowledge_bases(), gr.update(choices=list_learned_kb_files())),
+            outputs=[kb_inspector, kb_learned_dropdown],
+            show_progress="hidden",
+        )
+        kb_delete_btn.click(
+            fn=delete_learned_kbs,
+            inputs=[kb_learned_dropdown],
+            outputs=[kb_inspector, kb_learned_dropdown],
+        )
+
     # Show/hide AST checkbox based on ASR model
     def on_asr_change(asr_name):
         return gr.Checkbox(visible=(asr_name == "Granite Speech 3.3-8B"))
@@ -937,11 +2614,15 @@ with gr.Blocks(title="English Audio → Mandarin Chinese") as demo:
 
     submit_btn.click(
         fn=process_audio,
-        inputs=[audio_input, asr_dropdown, translation_dropdown, use_direct_ast],
+        inputs=[
+            audio_input, asr_dropdown, translation_dropdown,
+            use_direct_ast, use_cleanup, use_quality_eval,
+        ],
         outputs=[
             transcription_output, translation_output,
             raw_output, status_output,
             en_srt_output, zh_srt_output,
+            quality_output,
         ],
     )
 
