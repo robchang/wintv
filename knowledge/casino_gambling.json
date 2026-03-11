@@ -81,7 +81,21 @@
     "thanks for watching": "感谢收看",
     "thank you for watching": "感谢收看",
     "comprehensive guide": "全方位指南",
-    "your guide": "你的指南"
+    "your guide": "你的指南",
+    "place bet": "位置注（前二）",
+    "show bet": "展示注（前三）",
+    "Win/Place/Show": "独赢/位置/展示",
+    "pari-mutuel": "彩池投注",
+    "pelican": "鹈鹕",
+    "pelicans": "鹈鹕",
+    "buy-in amount": "买入金额",
+    "buy-ins": "买入金额",
+    "overhead screen": "顶部屏幕",
+    "overhead screens": "顶部屏幕",
+    "oldest pastimes": "Oldest Pastimes（保留英文，这是品牌名）",
+    "triple your fun": "三重乐趣（NOT 三倍你的乐趣）",
+    "split symbol": "分裂符号",
+    "split symbols": "分裂符号"
   },
   "rules": [
     "Card rank names: ALWAYS use A, K, Q, J, 10, 9... 2 (NEVER 国王, 皇后, 杰克). Example: 'pair of kings' → 一对K, 'queen high' → Q或以上, 'queen high or better' → Q高或更好的牌.",
@@ -138,7 +152,14 @@
     "'thanks for watching' / 'thank you for watching' = 感谢收看 (NOT 谢谢观看 which is understandable but less broadcast-standard).",
     "In slots: 'full reel symbol' / 'full reel' = 整轴符号 (NOT 完整的转轴符号). 'split symbol' = 分裂符号 (NOT 分割符号 which means divider). 'double symbol' = 双倍符号 (NOT 双赢符号 which means double-win). 'wheel slice' / 'slice of the wheel' = 转盘格 (NOT 转盘切片 which sounds like food slicing).",
     "In slots bonus mechanics: 'awards extra credits through this payout' = 通过这个赔付额外奖励积分 (NOT 通过这种赔付...给予额外积分 which is stilted). Use 奖励 not 给予 for prize-giving.",
-    "Avoid translationese in strategy/promo text: 'tips on strategy' = 策略小贴士 or 实用策略 (NOT 玩法策略的建议). 'it becomes very easy to play correctly' = 正确玩法就变得很简单 (NOT 正确地玩游戏就变得非常容易). 'win more money' = 赢更多 or 提高赢面 (NOT 赢得更多钱 which is too literal). 'lots of great games' = 丰富多样的游戏 (NOT 有很多精彩玩法)."
+    "Avoid translationese in strategy/promo text: 'tips on strategy' = 策略小贴士 or 实用策略 (NOT 玩法策略的建议). 'it becomes very easy to play correctly' = 正确玩法就变得很简单 (NOT 正确地玩游戏就变得非常容易). 'win more money' = 赢更多 or 提高赢面 (NOT 赢得更多钱 which is too literal). 'lots of great games' = 丰富多样的游戏 (NOT 有很多精彩玩法).",
+    "In horse racing: 'place' = finishing 1st or 2nd (前二/位置注), 'show' = finishing 1st, 2nd, or 3rd (前三/展示注). 'Win/Place/Show' = 独赢/位置/展示. Do NOT translate 'place' as '第二名' or 'show' as '第三名' — they mean 'top 2' and 'top 3' respectively.",
+    "'pari-mutuel' in horse racing = 彩池投注 (NOT 联合投注 which sounds like joint betting). Pari-mutuel means all bets are pooled.",
+    "In slots: 'overhead screen' / 'top screen' = 顶部屏幕 (NOT 头顶屏幕 which sounds like it's on your head). 'Triple your fun' = 三倍乐趣 or 乐趣翻三倍 (NOT 三倍你的乐趣 which is literal English word order).",
+    "'pelican' = 鹈鹕 (NOT 海鸥 which is seagull). These are different birds.",
+    "'buy-ins for any budget' / 'buy-in amounts' = 买入金额适合各种预算 (NOT 投入资金适合各种预算 — 投入资金 sounds like investment capital).",
+    "'Who you got?' / 'Who do you got?' in sports betting = 你看好谁？ or 你押谁？ followed by 我们这边 (NOT 我们的人 which sounds unnatural). Example: 'Who you got? Our people.' → '你看好谁？我们这边。'",
+    "In bingo: 'program' as a printed guide = 场次说明单 or 玩法说明单 (NOT 节目单 which means TV show listing, and NOT 活动安排 which is too generic)."
   ],
   "asr_errors": {
     "anti": "ante (底注)",
@@ -155,12 +176,15 @@
     "Trifectabet": "Trifecta bet",
     "Xactabox": "Exacta box",
     "emotional credit": "additional credit / extended credit (in slot machine contexts)",
-    "Who you got": "Who do you have? (你押谁？ — sports betting idiom for 'who are you betting on?')"
+    "Who you got": "Who do you have? (你押谁？ — sports betting idiom for 'who are you betting on?')",
+    "perimutual": "pari-mutuel (彩池投注)",
+    "haul": "hall (宾果厅, in bingo contexts)"
   },
   "brand_names_keep_english": [
     "Win TV",
     "Wheel of Fortune",
     "Twin Win",
-    "Video Poker"
+    "Video Poker",
+    "Oldest Pastimes"
   ]
 }

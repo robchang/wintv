@@ -109,6 +109,10 @@ Return one translated line per input, with the same [N] markers:
 RULES
 - Output EXACTLY the same number of [N] lines as the input. Never merge, split, or skip lines.
 - Write as if the script were originally written in Chinese. Avoid 翻译腔 (translation-style Chinese).
+  BAD: 你可以依赖WinTV作为你全方位的指南 → GOOD: WinTV带你全面了解
+  BAD: 准备好计划你的下一次幸运之旅 → GOOD: 计划你下一趟赌场之旅吧
+  BAD: 提前看看你最喜欢的游戏 → GOOD: 先了解你感兴趣的游戏
+  BAD: 这里有一些方法让你的体育博彩更安全 → GOOD: 几个让体育博彩更安全的方法
 - Use 你 throughout (never 您). Casual, approachable tone.
 - Simplified Chinese characters only. Chinese full-width punctuation.
 - Match the energy/tone of the English source (upbeat promo → upbeat Chinese, instructional → clear and direct).
@@ -190,12 +194,20 @@ Do NOT translate channel names, brand names, product names, or game titles.
 Keep them in English unless there is a well-known official Chinese name.
 If a previous segment incorrectly translated a brand name, fix it back to English.
 {domain_rules}
+10. Cross-Segment Split Repair
+If adjacent segments are clearly part of the SAME sentence split across subtitle boundaries,
+and the Chinese reads incoherently when the segments are read in sequence, rewrite BOTH segments
+so they flow naturally together. Keep them as separate segments with separate markers.
+Example:
+  BEFORE: [SEG 34] 庄家翻开牌后，你可以选择下Play注。 [SEG 35] 前三张公共牌。
+  AFTER:  [SEG 34] 在庄家翻开前三张公共牌后， [SEG 35] 你可以选择下一个两倍底注的Play注。
+
 CONSTRAINTS
 - Preserve ALL [SEG N] markers exactly as given.
 - Output EXACTLY the same number of segments as the input.
 - Keep edits minimal — only fix genuine issues.
 - Do not add or remove information.
-- Do not merge or split segments.
+- Do not merge or split segments (but you MAY redistribute content between adjacent split-sentence segments per rule 10).
 - NEVER truncate a segment. Each output segment must be a complete translation, not a fragment.
 
 OUTPUT
@@ -290,11 +302,12 @@ For each issue found, output ONE line:
 
 IMPORTANT — be precise and conservative:
 - CRITICAL means the translation is WRONG, not just imperfect. Use sparingly.
-- If the translation correctly conveys the meaning but uses different wording, that is NOT critical.
-- If an ASR error in the source was CORRECTLY translated (e.g. "anti" → 底注), do NOT flag it as CRITICAL. Use ASR_NOTE at most.
+- If the translation correctly conveys the meaning but uses different wording, that is NOT critical. Different valid phrasings are NOT errors.
+- If an ASR error in the source was CORRECTLY handled in the translation, do NOT flag it. The translator's job is to convey meaning, not reproduce ASR mistakes.
 - Do NOT flag acceptable Chinese for game names: 宾果 (Bingo), 牌九 (Pai Gow) are fine.
 - Do NOT flag style preferences. Only flag STYLE if the Chinese is clearly awkward or ungrammatical.
-- Expect ~0-3 CRITICAL issues per chunk of 15 segments. If you are flagging more, you are being too aggressive.
+- Do NOT flag minor word choice differences. "发牌" vs "派牌" for "deal" are both acceptable.
+- You should find 0-5 CRITICAL issues per chunk of 15 segments. If you are finding more, you are being too aggressive — reconsider each one.
 - If a chunk has no issues, output: CHUNK_OK
 
 Segments:
@@ -540,9 +553,10 @@ def format_domain_rules_for_block(ctx: DomainContext, block_texts: list[str]) ->
         scoped_rules = scoped_rules[:MAX_RULES_PER_BLOCK]
 
     parts = [f"\nDOMAIN-SPECIFIC RULES (detected domain: {ctx.domain})\n"]
+    parts.append("MANDATORY: You MUST use the exact glossary translations below. Do NOT substitute your own translation for any glossary term. This is non-negotiable.\n")
 
     if scoped_glossary:
-        parts.append("Terminology Glossary (use these exact translations):")
+        parts.append("Terminology Glossary (MANDATORY — use these EXACT translations):")
         for eng, zh in scoped_glossary.items():
             parts.append(f"  - {eng} = {zh}")
         parts.append("")
@@ -571,6 +585,7 @@ def generate_translation_brief(
     all_english: list[str],
     domain_ctx: DomainContext,
     tokenizer, model, device,
+    prev_qc_summary: str = "",
 ) -> str:
     """Generate a video-specific translation brief by analyzing the full transcript.
 
@@ -607,12 +622,16 @@ def generate_translation_brief(
         kb_sections.append(f"\nBrand Names (keep English): {', '.join(domain_ctx.brand_names)}")
     kb_text = "\n".join(kb_sections)
 
+    qc_section = ""
+    if prev_qc_summary:
+        qc_section = f"\n{prev_qc_summary}\n"
+
     user_msg = f"""TRANSCRIPT ({len(all_english)} segments):
 {transcript}
 
 DOMAIN KNOWLEDGE BASE ({domain_ctx.domain}):
 {kb_text}
-
+{qc_section}
 Generate the video-specific translation brief now."""
 
     print(f"  Brief generation: {len(all_english)} segments, ~{len(user_msg)} char prompt")
@@ -1360,10 +1379,13 @@ def translate_block(
     domain_ctx: DomainContext | None = None,
     translation_brief: str = "",
     extra_context: str = "",
+    prev_context: str = "",
+    next_context: str = "",
 ) -> dict[int, str]:
     """Translate a block of sentences as a paragraph.
     Returns {segment_index: chinese_text}.
-    Falls back to per-sentence 2-pass for any segments that fail."""
+    Falls back to per-sentence 2-pass for any segments that fail.
+    prev_context/next_context: adjacent segments for cross-boundary awareness."""
     tokenizer, model, device = _get_translator(translation_model_name)
 
     # Inject domain rules scoped to this block's content
@@ -1382,9 +1404,16 @@ def translate_block(
 
     prompt = BLOCK_TRANSLATION_PROMPT.format(domain_rules=domain_rules)
 
-    # Format input with [N] markers
-    input_lines = [f"[{i + 1}] {text}" for i, (_, text) in enumerate(block)]
-    input_text = "\n".join(input_lines)
+    # Format input with [N] markers, plus boundary context if available
+    parts = []
+    if prev_context:
+        parts.append(f"CONTEXT (previous segment — do NOT translate, for continuity only):\n[prev] {prev_context}\n")
+    parts.append("TRANSLATE these segments:")
+    for i, (_, text) in enumerate(block):
+        parts.append(f"[{i + 1}] {text}")
+    if next_context:
+        parts.append(f"\nCONTEXT (next segment — do NOT translate, for continuity only):\n[next] {next_context}")
+    input_text = "\n".join(parts)
 
     # Estimate output tokens: ~2x input char count, min 500
     est_tokens = max(500, len(input_text) * 2)
@@ -1689,7 +1718,7 @@ def quality_evaluate(
                 json={
                     "model": "eval",
                     "messages": [{"role": "user", "content": user_content}],
-                    "temperature": 0.3,
+                    "temperature": 0.1,
                     "max_tokens": 4096,
                     "chat_template_kwargs": {"enable_thinking": False},
                 },
@@ -1737,7 +1766,13 @@ def quality_evaluate(
                             })
 
             chunk_count = sum(1 for iss in llm_issues if start < iss['segment'] <= end)
-            print(f"  Eval chunk {chunk_idx}/{total_chunks}: {chunk_count} LLM issues")
+            # Cap: discard degenerate chunks that flag too many issues
+            MAX_ISSUES_PER_CHUNK = 12
+            if chunk_count > MAX_ISSUES_PER_CHUNK:
+                print(f"  Eval chunk {chunk_idx}/{total_chunks}: {chunk_count} issues — DISCARDED (degenerate, >{MAX_ISSUES_PER_CHUNK})")
+                llm_issues = [iss for iss in llm_issues if not (start < iss['segment'] <= end)]
+            else:
+                print(f"  Eval chunk {chunk_idx}/{total_chunks}: {chunk_count} LLM issues")
 
         except Exception as e:
             print(f"  Eval chunk {chunk_idx}/{total_chunks} failed: {e}")
@@ -2052,7 +2087,7 @@ def extract_rules_via_eval(
                 continue
 
             m = re.match(r'GLOSSARY:\s*(.+?)\s*=\s*(.+)', line)
-            if m and len(new_glossary) < 20:  # Cap glossary per extraction
+            if m and len(new_glossary) < 10:  # Cap glossary per extraction
                 eng = m.group(1).strip().strip('"').strip("'")
                 zh = m.group(2).strip().strip('"').strip("'")
                 if eng and zh and len(eng) > 1 and len(eng) < 50:
@@ -2095,8 +2130,10 @@ If no corrections need knowledge base updates, output: NO_KB_UPDATES
 """
 
 
-def _save_learned_kb(domain: str, glossary: dict, asr_errors: dict, rules: list) -> str | None:
-    """Save or update a learned KB file. Returns filename if written."""
+def _save_learned_kb(domain: str, glossary: dict, asr_errors: dict, rules: list,
+                     main_glossary: dict | None = None) -> str | None:
+    """Save or update a learned KB file. Returns filename if written.
+    main_glossary: if provided, learned entries that contradict it are skipped."""
     if not glossary and not asr_errors and not rules:
         return None
 
@@ -2114,14 +2151,24 @@ def _save_learned_kb(domain: str, glossary: dict, asr_errors: dict, rules: list)
         except (json.JSONDecodeError, OSError):
             pass
 
+    # Build main KB lookup for conflict checking
+    main_lower = {k.lower(): v for k, v in (main_glossary or {}).items()}
+
     # Merge — never overwrite existing entries, cap total sizes
-    MAX_LEARNED_GLOSSARY = 150
-    MAX_LEARNED_RULES = 60
+    MAX_LEARNED_GLOSSARY = 100
+    MAX_LEARNED_RULES = 30
 
     ex_glossary = existing.get("glossary", {})
+    skipped = 0
     for k, v in glossary.items():
+        # Skip entries that contradict the curated main KB
+        if k.lower() in main_lower and v != main_lower[k.lower()]:
+            skipped += 1
+            continue
         if k not in ex_glossary and len(ex_glossary) < MAX_LEARNED_GLOSSARY:
             ex_glossary[k] = v
+    if skipped:
+        print(f"  Skipped {skipped} learned glossary entries (contradict curated KB)")
 
     ex_asr = existing.get("asr_errors", {})
     for k, v in asr_errors.items():
@@ -2313,7 +2360,20 @@ def update_knowledge_from_feedback(
             new_glossary[eng] = zh
 
     # Save learned KB
-    filename = _save_learned_kb(domain_ctx.domain, new_glossary, new_asr_errors, new_rules)
+    # Build curated-only glossary for conflict checking (exclude learned KB files)
+    curated_glossary = {}
+    for path in sorted(KNOWLEDGE_DIR.glob("*.json")):
+        if "_learned" in path.name:
+            continue
+        try:
+            with open(path) as f:
+                curated_glossary.update(json.load(f).get("glossary", {}))
+        except (json.JSONDecodeError, OSError):
+            pass
+    filename = _save_learned_kb(
+        domain_ctx.domain, new_glossary, new_asr_errors, new_rules,
+        main_glossary=curated_glossary,
+    )
     if filename:
         total = len(new_glossary) + len(new_asr_errors) + len(new_rules)
         print(f"  Feedback → {filename}: {len(new_glossary)} glossary, "
@@ -2459,7 +2519,14 @@ def process_audio(
                 status=f"Translating block {block_idx+1}/{len(blocks)} ({seg_range})...",
             )
 
-            results = translate_block(block, translation_model_name, domain_ctx, translation_brief)
+            # Get boundary context from adjacent blocks
+            prev_ctx = blocks[block_idx - 1][-1][1] if block_idx > 0 else ""
+            next_ctx = blocks[block_idx + 1][0][1] if block_idx < len(blocks) - 1 else ""
+
+            results = translate_block(
+                block, translation_model_name, domain_ctx, translation_brief,
+                prev_context=prev_ctx, next_context=next_ctx,
+            )
             for seg_idx, chinese in results.items():
                 all_translations[seg_idx] = chinese
 
@@ -2528,6 +2595,7 @@ def process_audio(
         # --- Quality Evaluation ---
         quality_report = ""
         eval_issues = []
+        fix_comparisons = []
         if use_quality_eval:
             yield _yield(
                 transcription=" ".join(all_transcriptions),
@@ -2720,11 +2788,58 @@ def _score_translation(eval_issues: list[dict], total_segments: int) -> dict:
     }
 
 
+def _stable_score(all_english: list[str], all_chinese: list[str],
+                  domain_ctx: DomainContext | None) -> dict:
+    """Deterministic score using ONLY rule-based checks (glossary compliance etc).
+
+    This score is stable across runs — same input always gives same output.
+    Used for convergence detection in the self-improvement loop, since the LLM
+    eval is too inconsistent to serve as a progress metric.
+    """
+    rule_issues = rule_based_evaluate(all_english, all_chinese, domain_ctx)
+    score_info = _score_translation(rule_issues, len(all_english))
+    score_info["rule_issues"] = len(rule_issues)
+    return score_info
+
+
+def _summarize_qc_for_brief(eval_issues: list[dict]) -> str:
+    """Summarize QC issues by segment range and type for injection into the brief."""
+    if not eval_issues:
+        return ""
+
+    # Group by segment ranges (buckets of 15)
+    from collections import defaultdict
+    range_issues = defaultdict(list)
+    for iss in eval_issues:
+        if iss.get("severity") in ("CRITICAL", "MAJOR"):
+            bucket = ((iss["segment"] - 1) // 15) * 15 + 1
+            bucket_end = bucket + 14
+            range_issues[(bucket, bucket_end)].append(iss)
+
+    if not range_issues:
+        return ""
+
+    lines = ["PREVIOUS ITERATION QC FINDINGS (address these problem areas in your brief):"]
+    for (start, end), issues in sorted(range_issues.items()):
+        types = set(iss["type"] for iss in issues)
+        terms = set()
+        for iss in issues:
+            # Extract key terms from descriptions
+            desc = iss.get("description", "")
+            for match in re.finditer(r"'([^']+)'", desc):
+                terms.add(match.group(1))
+        term_str = f" ({', '.join(list(terms)[:5])})" if terms else ""
+        lines.append(f"- Segments {start}-{end}: {', '.join(types)}{term_str}")
+
+    return "\n".join(lines)
+
+
 def self_improve_iteration(
     all_english: list[str],
     translation_model_name: str,
     asr_results: list[tuple],
     iteration: int,
+    prev_qc_summary: str = "",
 ) -> dict:
     """Run one self-improvement iteration: reload KB → re-translate → eval → fix → extract rules.
 
@@ -2739,9 +2854,10 @@ def self_improve_iteration(
     domain_ctx = load_domain_knowledge(all_english, tokenizer, model, device)
     print(f"  KB loaded: {len(domain_ctx.glossary)} glossary, {len(domain_ctx.rules)} rules")
 
-    # 2. Generate brief
+    # 2. Generate brief (with QC feedback from previous iteration if available)
     translation_brief = generate_translation_brief(
         all_english, domain_ctx, tokenizer, model, device,
+        prev_qc_summary=prev_qc_summary,
     )
 
     # 3. Re-translate all segments
@@ -2749,7 +2865,12 @@ def self_improve_iteration(
     blocks = _group_segments_into_blocks(asr_results)
     all_translations = [""] * len(all_english)
     for block_idx, block in enumerate(blocks):
-        results = translate_block(block, translation_model_name, domain_ctx, translation_brief)
+        prev_ctx = blocks[block_idx - 1][-1][1] if block_idx > 0 else ""
+        next_ctx = blocks[block_idx + 1][0][1] if block_idx < len(blocks) - 1 else ""
+        results = translate_block(
+            block, translation_model_name, domain_ctx, translation_brief,
+            prev_context=prev_ctx, next_context=next_ctx,
+        )
         for seg_idx, chinese in results.items():
             all_translations[seg_idx] = chinese
     print(f"  Translation complete: {len(blocks)} blocks")
@@ -2763,12 +2884,16 @@ def self_improve_iteration(
             translation_model_name, domain_ctx, translation_brief,
         )
 
-    # 5. Quality evaluation
+    # 5. Quality evaluation — two separate scores:
+    #    - stable_score: deterministic rule-based only (for convergence)
+    #    - llm_score: full eval including LLM (for critique/rule extraction)
     print(f"  Running quality evaluation...")
     eval_issues = quality_evaluate(all_english, all_translations, domain_ctx)
-    score_info = _score_translation(eval_issues, len(all_english))
-    print(f"  Score: {score_info['score']} "
-          f"(C:{score_info['critical']} M:{score_info['major']} m:{score_info['minor']})")
+    llm_score = _score_translation(eval_issues, len(all_english))
+    stable = _stable_score(all_english, all_translations, domain_ctx)
+    print(f"  Stable score: {stable['score']} (rule-based: {stable['rule_issues']} issues)")
+    print(f"  LLM score: {llm_score['score']} "
+          f"(C:{llm_score['critical']} M:{llm_score['major']} m:{llm_score['minor']})")
 
     # 6. Fix critical issues
     fix_comparisons = []
@@ -2782,15 +2907,15 @@ def self_improve_iteration(
         for seg_idx, new_zh in fixes.items():
             all_translations[seg_idx] = new_zh
 
-        # Skip expensive post-fix re-eval — use pre-fix score for convergence
-        # The eval model is too inconsistent between runs to give reliable post-fix scores
-        post_fix_score = score_info  # Use pre-fix score as canonical
-        post_fix_issues = eval_issues
         changed_count = sum(1 for c in fix_comparisons if c["before"] != c["after"])
-        print(f"  Applied {changed_count} fixes (skipping re-eval for stability)")
+        print(f"  Applied {changed_count} fixes")
+
+        # Re-score with stable (deterministic) metric after fixes
+        post_fix_stable = _stable_score(all_english, all_translations, domain_ctx)
+        print(f"  Post-fix stable score: {post_fix_stable['score']} "
+              f"(was {stable['score']}, delta {post_fix_stable['score'] - stable['score']:+.1f})")
     else:
-        post_fix_issues = eval_issues
-        post_fix_score = score_info
+        post_fix_stable = stable
 
     # 7. Extract rules and update KB
     print(f"  Extracting rules from feedback...")
@@ -2804,9 +2929,9 @@ def self_improve_iteration(
     # Build report
     report_lines = [
         f"=== Iteration {iteration} ===",
-        f"Score: {score_info['score']} → {post_fix_score['score']} (after fixes)",
-        f"Issues: {score_info['critical']}C / {score_info['major']}M / {score_info['minor']}m"
-        f" → {post_fix_score['critical']}C / {post_fix_score['major']}M / {post_fix_score['minor']}m",
+        f"Stable score: {stable['score']} → {post_fix_stable['score']} (rule-based, deterministic)",
+        f"LLM score: {llm_score['score']} "
+        f"(C:{llm_score['critical']} M:{llm_score['major']} m:{llm_score['minor']})",
         f"KB: {len(domain_ctx.glossary)} glossary, {len(domain_ctx.rules)} rules",
         f"KB updated: {kb_file or 'no changes'}",
     ]
@@ -2818,10 +2943,9 @@ def self_improve_iteration(
     return {
         "translations": all_translations,
         "eval_issues": eval_issues,
-        "post_fix_issues": post_fix_issues,
         "fix_comparisons": fix_comparisons,
-        "pre_fix_score": score_info,
-        "post_fix_score": post_fix_score,
+        "stable_score": post_fix_stable,  # Deterministic — use for convergence
+        "llm_score": llm_score,            # Noisy — use for critique only
         "kb_file": kb_file,
         "domain_ctx": domain_ctx,
         "report": "\n".join(report_lines),
@@ -2871,6 +2995,7 @@ def run_improvement_loop(
         best_translations = None
         best_score = 0.0
         stall_count = 0
+        prev_qc_summary = ""  # QC findings fed back into brief
 
         for iteration in range(1, max_iterations + 1):
             yield _yield_loop(
@@ -2880,14 +3005,16 @@ def run_improvement_loop(
 
             result = self_improve_iteration(
                 all_english, translation_model_name, asr_results, iteration,
+                prev_qc_summary=prev_qc_summary,
             )
 
-            score = result["post_fix_score"]["score"]
+            stable_score = result["stable_score"]["score"]
+            llm_score = result["llm_score"]["score"]
             all_reports.append(result["report"])
 
-            # Track best
-            if score > best_score:
-                best_score = score
+            # Track best using stable (deterministic) score
+            if stable_score > best_score:
+                best_score = stable_score
                 best_translations = list(result["translations"])
 
             # Build SRT files for current best
@@ -2917,7 +3044,7 @@ def run_improvement_loop(
                     f.write(en_srt)
 
             # Quality report for latest
-            quality_text = format_eval_report(result["post_fix_issues"])
+            quality_text = format_eval_report(result["eval_issues"])
             if result["fix_comparisons"]:
                 comparison_text = format_fix_comparison(result["fix_comparisons"])
                 if comparison_text:
@@ -2931,10 +3058,10 @@ def run_improvement_loop(
 
             yield _yield_loop(
                 status=(
-                    f"Iteration {iteration}: score {score:.1f} "
-                    f"(C:{result['post_fix_score']['critical']} "
-                    f"M:{result['post_fix_score']['major']} "
-                    f"m:{result['post_fix_score']['minor']}) "
+                    f"Iteration {iteration}: stable={stable_score:.1f} llm={llm_score:.1f} "
+                    f"(C:{result['llm_score']['critical']} "
+                    f"M:{result['llm_score']['major']} "
+                    f"m:{result['llm_score']['minor']}) "
                     f"| KB: {result['kb_file'] or 'no update'}"
                 ),
                 reports="\n\n".join(all_reports),
@@ -2944,19 +3071,36 @@ def run_improvement_loop(
                 zh_srt=zh_srt_path,
             )
 
-            # Convergence checks
-            score_delta = score - prev_score
-            print(f"  Score delta: {score_delta:+.1f} (threshold: {convergence_threshold})")
+            # Convergence checks — use stable (deterministic) score
+            score_delta = stable_score - prev_score
+            print(f"  Stable score delta: {score_delta:+.1f} (threshold: {convergence_threshold})")
+
+            # Stop if score DROPPED significantly below best — KB may be degrading quality
+            if iteration > 2 and stable_score < best_score - 1.0:
+                all_reports.append(
+                    f"=== STOPPED at iteration {iteration} (score regression) ===\n"
+                    f"Stable score {stable_score:.1f} dropped below best {best_score:.1f}. "
+                    f"Using best translations from earlier iteration."
+                )
+                yield _yield_loop(
+                    status=f"Score regressed at iteration {iteration}. Best stable score: {best_score:.1f}",
+                    reports="\n\n".join(all_reports),
+                    quality=quality_text,
+                    translation=translation_text,
+                    en_srt=en_srt_path,
+                    zh_srt=zh_srt_path,
+                )
+                break
 
             if iteration > 1 and abs(score_delta) < convergence_threshold:
                 stall_count += 1
                 if stall_count >= 2:
                     all_reports.append(
                         f"=== CONVERGED at iteration {iteration} ===\n"
-                        f"Score stable at {score:.1f} for {stall_count} iterations. Stopping."
+                        f"Stable score at {stable_score:.1f} for {stall_count} iterations. Stopping."
                     )
                     yield _yield_loop(
-                        status=f"Converged at iteration {iteration}. Best score: {best_score:.1f}",
+                        status=f"Converged at iteration {iteration}. Best stable score: {best_score:.1f}",
                         reports="\n\n".join(all_reports),
                         quality=quality_text,
                         translation=translation_text,
@@ -2973,7 +3117,7 @@ def run_improvement_loop(
                     f"No new rules or glossary entries learned. Stopping."
                 )
                 yield _yield_loop(
-                    status=f"No new KB entries at iteration {iteration}. Best score: {best_score:.1f}",
+                    status=f"No new KB entries at iteration {iteration}. Best stable score: {best_score:.1f}",
                     reports="\n\n".join(all_reports),
                     quality=quality_text,
                     translation=translation_text,
@@ -2982,15 +3126,17 @@ def run_improvement_loop(
                 )
                 break
 
-            prev_score = score
+            prev_score = stable_score
+            # Build QC summary for next iteration's brief
+            prev_qc_summary = _summarize_qc_for_brief(result["eval_issues"])
 
         else:
             all_reports.append(
                 f"=== MAX ITERATIONS ({max_iterations}) REACHED ===\n"
-                f"Best score: {best_score:.1f}"
+                f"Best stable score: {best_score:.1f}"
             )
             yield _yield_loop(
-                status=f"Max iterations reached. Best score: {best_score:.1f}",
+                status=f"Max iterations reached. Best stable score: {best_score:.1f}",
                 reports="\n\n".join(all_reports),
                 quality=quality_text,
                 translation=translation_text,
