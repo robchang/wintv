@@ -70,7 +70,7 @@ RULES
 - Match the energy/tone of the English (upbeat → upbeat, instructional → clear and direct).
 - Keep sentences short and direct — suitable for subtitle reading in 2-3 seconds.
 - Translate numbers, quantities, and odds exactly.
-  "Over a dozen" → "十几个". "Half a dozen" → "六个左右" (≈6, NOT 十几个).
+  "Over a dozen" → "十几个". "Half a dozen" → "六个左右" (≈6, NOT 十几个). "Over half a dozen" → "六个以上".
 - Preserve currency context (dollars, not 元, for US contexts).
 - Do NOT translate channel names, brand names, product names, or game titles. Keep them in English
   unless there is a well-known official Chinese name. When in doubt, keep English.
@@ -118,7 +118,7 @@ RULES
 - Match the energy/tone of the English source (upbeat promo → upbeat Chinese, instructional → clear and direct).
 - Keep each line concise — suitable for subtitle reading in 2-3 seconds.
 - Translate numbers, quantities, and odds exactly as stated.
-  "Over a dozen" → "十几个". "Half a dozen" → "六个左右" (≈6, NOT 十几个).
+  "Over a dozen" → "十几个". "Half a dozen" → "六个左右" (≈6, NOT 十几个). "Over half a dozen" → "六个以上".
 - Preserve currency context (dollars, not 元, for US contexts).
 - Do NOT translate channel names, brand names, product names, or game titles. Keep them in English
   unless there is a well-known official Chinese name. When in doubt, keep English.
@@ -194,13 +194,38 @@ Do NOT translate channel names, brand names, product names, or game titles.
 Keep them in English unless there is a well-known official Chinese name.
 If a previous segment incorrectly translated a brand name, fix it back to English.
 {domain_rules}
-10. Cross-Segment Split Repair
-If adjacent segments are clearly part of the SAME sentence split across subtitle boundaries,
-and the Chinese reads incoherently when the segments are read in sequence, rewrite BOTH segments
-so they flow naturally together. Keep them as separate segments with separate markers.
-Example:
+10. Cross-Segment Split Repair (IMPORTANT — actively look for these)
+When the English splits a sentence across two segments (e.g., "after the dealer turns over" / "the first three community cards"), the Chinese MUST read as one coherent sentence across both segments.
+Scan ALL adjacent segment pairs. If the Chinese sounds broken or disconnected when read in sequence, REWRITE both segments to flow naturally. Keep them as separate segments with separate markers.
+
+Example 1:
   BEFORE: [SEG 34] 庄家翻开牌后，你可以选择下Play注。 [SEG 35] 前三张公共牌。
   AFTER:  [SEG 34] 在庄家翻开前三张公共牌后， [SEG 35] 你可以选择下一个两倍底注的Play注。
+
+Example 2:
+  BEFORE: [SEG 40] 你需要要么通过下Play注来跟注，要么弃牌并放弃 [SEG 41] 你的底注和盲注。
+  AFTER:  [SEG 40] 你需要下等于底注的Play注来跟注， [SEG 41] 否则就弃牌，放弃底注和盲注。
+
+Example 3 (truncated/incomplete segment):
+  BEFORE: [SEG 66] 如果你拿到J或更高的四条  (ends abruptly, no conclusion)
+  AFTER:  [SEG 66] 如果你拿到J或以上的四条，总是拆成两对。
+
+When you find a segment that ends mid-thought with no verb or conclusion, check the English source — the full meaning may be in that segment but the translation was cut short. Complete the thought.
+
+11. Anti-Translationese (IMPORTANT — actively fix these)
+If any segment sounds like translated English rather than natural Chinese, rewrite it.
+Common patterns to fix:
+  - 你可以依赖X作为你的Y → X带你了解Y / 跟着X了解Y
+  - 准备好计划你的… → 准备开启你的…
+  - 这里有一些方法让你的… → 几个让…的方法
+  - 赢得更多钱 → 赢更多 / 提高赢面
+  - 提前看看你最喜欢的游戏 → 先了解你感兴趣的游戏
+  - 让别人开车，自己在旅途中放松一下 → 让别人开车，你在车上放松
+  - 正确地玩游戏就变得非常容易 → 正确玩法就变得很简单
+  - 轮盘大富翁 → Wheel of Fortune（品牌名，不翻译）
+
+12. Output Discipline
+NEVER output alternative translations like '选项A" 或 "选项B'. Always output ONE definitive translation per segment.
 
 CONSTRAINTS
 - Preserve ALL [SEG N] markers exactly as given.
@@ -312,6 +337,52 @@ IMPORTANT — be precise and conservative:
 
 Segments:
 """
+
+NATURALNESS_EVAL_PROMPT = """\
+You are a native Mandarin Chinese linguist reviewing EN→ZH broadcast subtitles for NATURALNESS.
+You are NOT checking for translation errors — a separate pass handles that.
+Your ONLY job: does the Chinese sound like it was written by a native speaker for Chinese-speaking viewers?
+
+{domain_rules}
+
+For each segment, score on this scale:
+  A — Sounds fully native. A Chinese viewer would not suspect this is translated.
+  B — Acceptable. Minor stiffness but perfectly understandable and broadcast-ready.
+  C — Translationese. Grammatically correct but reads like translated text. Needs revision.
+  D — Awkward/unnatural. A native speaker would never phrase it this way.
+
+Common translationese patterns to watch for:
+- Overly formal/stiff phrasing where casual broadcast tone is expected
+- Word-for-word English sentence structure preserved in Chinese
+- Unnecessary pronouns (你的, 我们的) that Chinese would omit
+- Passive constructions where Chinese uses active voice
+- Marketing/promotional tone that sounds like ad copy, not broadcast narration
+- Literal translations of English idioms/collocations
+
+For each segment, output ONE line:
+[N] GRADE: suggestion (only if C or D)
+
+For A and B segments, still output the line but no suggestion needed:
+[N] A
+[N] B
+
+Examples:
+[5] A
+[6] C: "你可以依赖WinTV作为你的指南" → "跟着WinTV了解" — remove unnecessary 你的, simplify
+[7] D: "准备好计划你的下一次幸运之旅" → "计划你的下一趟赌场之旅吧" — 幸运之旅 is translationese
+[8] B
+
+IMPORTANT:
+- Grade EVERY segment, not just problematic ones.
+- Be generous with B grades — minor imperfections are fine for subtitles.
+- Reserve C/D for segments where a native speaker would noticeably wince.
+- Your suggestions should be CONCRETE — provide the actual revised Chinese text after →.
+- Keep suggestions the same length or shorter (these are subtitles).
+
+Segments:
+"""
+
+NATURALNESS_CHUNK_SIZE = 15  # Segments per naturalness eval chunk
 
 # --- Knowledge Base Directory ---
 
@@ -519,12 +590,12 @@ def format_domain_rules_for_block(ctx: DomainContext, block_texts: list[str]) ->
     RULE_SCOPE_KEYWORDS = {
         "Pai Gow": ["pai gow", "joker", "high hand", "low hand", "set hand", "split", "five aces", "two pair", "setting your hand", "hand-setting"],
         "bingo": ["bingo", "hall", "dauber", "caller", "program", "game", "running", "good cause"],
-        "slots": ["slot", "reel", "symbol", "wheel", "spin", "credits", "payline", "split symbol", "double symbol", "full reel", "bonus round", "wheel slice"],
-        "horse racing": ["horse", "racing", "win/place/show", "place", "show", "exacta", "trifecta", "pick three", "pick four", "pick five", "pari-mutuel"],
+        "slots": ["slot", "reel", "symbol", "wheel", "spin", "credits", "payline", "split symbol", "double symbol", "full reel", "bonus round", "wheel slice", "multi-way", "multiplay", "wheel of fortune", "emotional credit", "overhead screen"],
+        "horse racing": ["horse", "racing", "win/place/show", "exacta", "trifecta", "pick three", "pick four", "pick five", "pari-mutuel", "off-track", "wagering"],
         "three card poker": ["three card", "play or fold", "play bet"],
         "poker": ["check", "call", "raise", "fold", "ante", "hole cards", "four of a kind", "full house", "pair", "community", "flop", "draw", "hand", "medium pair", "high pair", "low pair", "turns over", "dealer turns"],
-        "promo": ["promo", "atmosphere", "plan your", "best place", "our people", "our staff", "everyone", "more play", "more action", "lucky trip", "rely on", "comprehensive guide", "thanks for watching", "thank you for watching", "win more", "tips on", "strategy", "easy to play"],
-        "general": ["brand", "natural", "style", "dozen", "who you got", "translationese"],
+        "promo": ["promo", "atmosphere", "plan your", "best place", "our people", "our staff", "our guys", "everyone", "more play", "more action", "lucky trip", "rely on", "count on", "comprehensive guide", "thanks for watching", "thank you for watching", "win more", "tips on", "strategy", "easy to play", "sneak peek", "excitement", "alive and well", "going strong", "responsible", "test the waters", "give it a try"],
+        "general": ["brand", "natural", "style", "dozen", "who you got", "translationese", "research the venue", "local game"],
     }
 
     def _rule_is_relevant(rule: str, block_lower: str) -> bool:
@@ -1499,6 +1570,7 @@ def cleanup_translation(
     translation_model_name: str,
     domain_ctx: DomainContext | None = None,
     translation_brief: str = "",
+    naturalness_issues: str = "",
 ) -> list[str]:
     """Document-level consistency pass over the full translation (batched)."""
     tokenizer, model, device = _get_translator(translation_model_name)
@@ -1507,6 +1579,8 @@ def cleanup_translation(
     domain_rules = format_domain_rules(domain_ctx) if domain_ctx else ""
     if translation_brief:
         domain_rules += f"\nVIDEO-SPECIFIC TRANSLATION BRIEF:\n{translation_brief}\n"
+    if naturalness_issues:
+        domain_rules += f"\n{naturalness_issues}\n"
     prompt = CLEANUP_PROMPT.format(domain_rules=domain_rules)
 
     n = len(all_english)
@@ -1931,6 +2005,220 @@ def format_fix_comparison(comparisons: list[dict]) -> str:
 
     if unchanged:
         lines.append(f"  ({len(unchanged)} segments unchanged after re-translation)")
+
+    return "\n".join(lines)
+
+
+# --- Naturalness Evaluation Pass ---
+
+
+def naturalness_evaluate(
+    all_english: list[str],
+    all_chinese: list[str],
+    domain_ctx: DomainContext | None = None,
+) -> list[dict]:
+    """Evaluate translation naturalness using the eval LLM.
+    Returns list of dicts with keys: segment, grade, suggestion, english, chinese."""
+    if not _eval_llm_available():
+        print("  Naturalness eval: eval LLM not available")
+        return []
+
+    domain_rules = format_domain_rules(domain_ctx) if domain_ctx else ""
+    results = []
+    total = len(all_english)
+
+    for start in range(0, total, NATURALNESS_CHUNK_SIZE):
+        end = min(start + NATURALNESS_CHUNK_SIZE, total)
+        chunk_idx = start // NATURALNESS_CHUNK_SIZE + 1
+        total_chunks = (total + NATURALNESS_CHUNK_SIZE - 1) // NATURALNESS_CHUNK_SIZE
+
+        segments = []
+        for i in range(start, end):
+            segments.append(f"[{i + 1}] EN: {all_english[i]} | ZH: {all_chinese[i]}")
+        segments_text = "\n".join(segments)
+
+        prompt_text = NATURALNESS_EVAL_PROMPT.format(domain_rules=domain_rules)
+        user_content = prompt_text + segments_text
+
+        try:
+            resp = requests.post(
+                EVAL_API_URL,
+                json={
+                    "model": "eval",
+                    "messages": [{"role": "user", "content": user_content}],
+                    "temperature": 0.1,
+                    "max_tokens": 8000,
+                    "chat_template_kwargs": {"enable_thinking": False},
+                },
+                timeout=300,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            msg = data["choices"][0]["message"]
+            content = (msg.get("content") or "").strip()
+
+            preview = content[:200].replace('\n', ' ') if content else "(empty)"
+            print(f"  Naturalness chunk {chunk_idx}/{total_chunks} raw: {preview}...")
+
+            # Parse grades: [N] GRADE or [N] GRADE: suggestion
+            chunk_results = []
+            for line in content.split("\n"):
+                line = line.strip()
+                if not line:
+                    continue
+                # Match [N] A/B/C/D with optional suggestion
+                m = re.match(r"\[(\d+)\]\s*([ABCD])(?::\s*(.+))?", line)
+                if m:
+                    seg_num = int(m.group(1))
+                    if 1 <= seg_num <= total:
+                        grade = m.group(2)
+                        suggestion_raw = (m.group(3) or "").strip()
+                        # Extract the suggested Chinese text after →
+                        suggested_zh = ""
+                        if "→" in suggestion_raw:
+                            parts = suggestion_raw.split("→", 1)
+                            suggested_zh = parts[1].strip().split("—")[0].strip().strip('"').strip('"').strip('"')
+                        chunk_results.append({
+                            "segment": seg_num,
+                            "grade": grade,
+                            "suggestion": suggestion_raw,
+                            "suggested_zh": suggested_zh,
+                            "english": all_english[seg_num - 1],
+                            "chinese": all_chinese[seg_num - 1],
+                        })
+
+            grades = [r["grade"] for r in chunk_results]
+            grade_counts = {g: grades.count(g) for g in "ABCD" if grades.count(g) > 0}
+            print(f"  Naturalness chunk {chunk_idx}/{total_chunks}: {grade_counts}")
+            results.extend(chunk_results)
+
+        except Exception as e:
+            print(f"  Naturalness chunk {chunk_idx}/{total_chunks} failed: {e}")
+
+    return results
+
+
+def fix_naturalness_issues(
+    nat_results: list[dict],
+    all_english: list[str],
+    all_translations: list[str],
+    translation_model_name: str,
+    domain_ctx: DomainContext | None = None,
+    translation_brief: str = "",
+) -> tuple[dict[int, str], list[dict]]:
+    """Fix segments graded C or D by the naturalness eval.
+    For segments with a concrete suggested_zh, use it directly.
+    For others, re-translate with naturalness guidance.
+    Returns (fixes_dict, comparison_records)."""
+    MAX_NAT_FIX = 30  # Cap — don't re-translate too many
+
+    cd_results = [r for r in nat_results if r["grade"] in ("C", "D")]
+    if not cd_results:
+        return {}, []
+
+    # Prioritize D over C, then by segment order
+    cd_results.sort(key=lambda r: (0 if r["grade"] == "D" else 1, r["segment"]))
+    if len(cd_results) > MAX_NAT_FIX:
+        print(f"  Naturalness fix: capping at {MAX_NAT_FIX} of {len(cd_results)} C/D segments")
+        cd_results = cd_results[:MAX_NAT_FIX]
+
+    # Split into direct-fix (has suggested_zh) and re-translate (needs LLM)
+    direct_fixes = {}
+    needs_retranslation = []
+    for r in cd_results:
+        seg_idx = r["segment"] - 1
+        if r["suggested_zh"] and len(r["suggested_zh"]) > 2:
+            direct_fixes[seg_idx] = r["suggested_zh"]
+        else:
+            needs_retranslation.append(r)
+
+    # Re-translate segments without direct suggestions
+    retranslated = {}
+    if needs_retranslation:
+        guidance_lines = [
+            "NATURALNESS ISSUES — re-translate these segments to sound like native Mandarin broadcast subtitles.",
+            "The current translations are grammatically correct but sound like translated text.",
+            "Make them sound natural — as if originally written in Chinese for Chinese viewers.",
+            "",
+        ]
+        for r in needs_retranslation:
+            guidance_lines.append(
+                f"[SEG {r['segment']}] Grade {r['grade']}: {r['suggestion']}"
+            )
+        fix_guidance = "\n".join(guidance_lines)
+
+        block = [(r["segment"] - 1, all_english[r["segment"] - 1]) for r in needs_retranslation]
+
+        print(f"  Re-translating {len(block)} segments for naturalness...")
+        retranslated = translate_block(
+            block, translation_model_name, domain_ctx, translation_brief,
+            extra_context=fix_guidance,
+        )
+
+    # Merge all fixes
+    all_fixes = {**direct_fixes, **retranslated}
+
+    # Build comparison records
+    comparisons = []
+    for r in cd_results:
+        seg_idx = r["segment"] - 1
+        new_zh = all_fixes.get(seg_idx, all_translations[seg_idx])
+        comparisons.append({
+            "segment": r["segment"],
+            "english": r["english"],
+            "before": all_translations[seg_idx],
+            "after": new_zh,
+            "grade": r["grade"],
+            "suggestion": r["suggestion"],
+        })
+
+    changed = sum(1 for c in comparisons if c["before"] != c["after"])
+    print(f"  Naturalness fixes: {changed} of {len(comparisons)} C/D segments changed "
+          f"({len(direct_fixes)} direct, {len(retranslated)} re-translated)")
+
+    return all_fixes, comparisons
+
+
+def format_naturalness_report(nat_results: list[dict], comparisons: list[dict] | None = None) -> str:
+    """Format naturalness evaluation results."""
+    if not nat_results:
+        return ""
+
+    grades = [r["grade"] for r in nat_results]
+    total = len(grades)
+    counts = {g: grades.count(g) for g in "ABCD"}
+    pct_ab = (counts["A"] + counts["B"]) / total * 100 if total else 0
+
+    lines = [
+        f"{'='*50}",
+        f"  NATURALNESS EVALUATION ({total} segments)",
+        f"{'='*50}",
+        f"  A (native):       {counts['A']:3d} ({counts['A']/total*100:.0f}%)",
+        f"  B (acceptable):   {counts['B']:3d} ({counts['B']/total*100:.0f}%)",
+        f"  C (translationese): {counts['C']:3d} ({counts['C']/total*100:.0f}%)",
+        f"  D (awkward):      {counts['D']:3d} ({counts['D']/total*100:.0f}%)",
+        f"  Broadcast-ready (A+B): {pct_ab:.0f}%",
+        "",
+    ]
+
+    # Show C/D details
+    cd = [r for r in nat_results if r["grade"] in ("C", "D")]
+    if cd:
+        lines.append("  Issues:")
+        for r in cd:
+            lines.append(f"  [{r['segment']}] {r['grade']}: {r['suggestion']}")
+        lines.append("")
+
+    # Show fixes if applied
+    if comparisons:
+        changed = [c for c in comparisons if c["before"] != c["after"]]
+        if changed:
+            lines.append(f"  AUTO-FIXED ({len(changed)} segments):")
+            for c in changed:
+                lines.append(f"  [SEG {c['segment']}] {c['grade']}")
+                lines.append(f"    BEFORE: {c['before']}")
+                lines.append(f"    AFTER:  {c['after']}")
+                lines.append("")
 
     return "\n".join(lines)
 
@@ -2430,6 +2718,7 @@ def process_audio(
     use_direct_ast: bool,
     use_cleanup: bool,
     use_quality_eval: bool,
+    use_naturalness_eval: bool = True,
 ):
     """Full pipeline: preprocess, transcribe, translate, yield progressive results.
     Yields tuples of (transcription, translation, raw, status, en_srt, zh_srt, quality_report).
@@ -2536,6 +2825,32 @@ def process_audio(
                 status=f"Block {block_idx+1}/{len(blocks)} done.",
             )
 
+        # --- Naturalness evaluation (feeds into cleanup) ---
+        naturalness_guidance = ""
+        nat_results = []
+        if use_naturalness_eval:
+            yield _yield(
+                transcription=" ".join(all_transcriptions),
+                translation=" ".join(t for t in all_translations if t),
+                status="Running naturalness evaluation...",
+            )
+            nat_results = naturalness_evaluate(all_transcriptions, all_translations, domain_ctx)
+            if nat_results:
+                # Build guidance for cleanup pass from C/D segments
+                cd_issues = [r for r in nat_results if r["grade"] in ("C", "D")]
+                if cd_issues:
+                    lines = [
+                        "NATURALNESS ISSUES DETECTED (fix these during cleanup):",
+                        "The following segments were graded C or D for naturalness.",
+                        "Rewrite them to sound like native Chinese subtitles while preserving ALL meaning and completeness.",
+                        "Do NOT shorten, truncate, or omit content — only rephrase for natural flow.",
+                        "",
+                    ]
+                    for r in cd_issues:
+                        lines.append(f"  [SEG {r['segment']}] Grade {r['grade']}: {r['suggestion']}")
+                    naturalness_guidance = "\n".join(lines)
+                    print(f"  Naturalness eval: {len(cd_issues)} C/D issues will be fed to cleanup")
+
         # --- Document-level cleanup pass ---
         pre_cleanup = list(all_translations)
         if use_cleanup and len(asr_results) > 1:
@@ -2547,6 +2862,7 @@ def process_audio(
             cleaned = cleanup_translation(
                 all_transcriptions, all_translations,
                 translation_model_name, domain_ctx, translation_brief,
+                naturalness_issues=naturalness_guidance,
             )
             all_translations = cleaned
 
@@ -2651,6 +2967,12 @@ def process_audio(
                 comparison_text = format_fix_comparison(fix_comparisons)
                 if comparison_text:
                     quality_report += "\n\n" + comparison_text
+
+        # --- Naturalness Report (eval ran before cleanup, report results here) ---
+        if nat_results:
+            nat_report = format_naturalness_report(nat_results)
+            if nat_report:
+                quality_report += "\n\n" + nat_report
 
         # --- Feedback-to-KB (learn from corrections) ---
         try:
@@ -3198,6 +3520,11 @@ with gr.Blocks(title="English Audio → Mandarin Chinese") as demo:
             info="Two-layer quality evaluation: rule-based checks + LLM review (requires llama-server on port 8081).",
             value=False,
         )
+        use_naturalness_eval = gr.Checkbox(
+            label="Naturalness evaluation",
+            info="Dedicated naturalness pass: grades A-D, auto-fixes translationese (C/D segments). Requires eval LLM.",
+            value=True,
+        )
 
     submit_btn = gr.Button("Transcribe & Translate", variant="primary")
 
@@ -3281,7 +3608,7 @@ with gr.Blocks(title="English Audio → Mandarin Chinese") as demo:
         fn=process_audio,
         inputs=[
             audio_input, asr_dropdown, translation_dropdown,
-            use_direct_ast, use_cleanup, use_quality_eval,
+            use_direct_ast, use_cleanup, use_quality_eval, use_naturalness_eval,
         ],
         outputs=[
             transcription_output, translation_output,
