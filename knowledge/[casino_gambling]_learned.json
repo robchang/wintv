@@ -4,7 +4,7 @@
   "_meta": {
     "created": "2026-03-11",
     "last_updated": "2026-03-12",
-    "source_runs": 6
+    "source_runs": 7
   },
   "keywords": [],
   "glossary": {
@@ -78,7 +78,21 @@
     "Jack Eight": "J8",
     "Jack 10": "J10",
     "pair of aces": "一对A",
-    "Trifecta Bet": "连赢三关注"
+    "Trifecta Bet": "连赢三关注",
+    "five kicker or better\" translated as \"五或更高\" is correct per glossary (\"four jacks or above": "J 或更高\"). No error.",
+    "whole cards\" (ASR for hole cards) translated as \"底牌\" is correct per glossary, but the phrase \"包含你的底牌中的一张\" is slightly awkward. However, the glossary says \"whole cards": "底牌\". The translation is correct. No error here.",
+    "straight or better\" translated as \"顺子或更好的牌型\"; this is correct per the strict rule \"straight": "顺子\". The previous analysis noted a pattern of error \"一条\", but this specific segment [44] uses \"顺子\". So [44] is CORRECT.",
+    "pear\" (ASR error for \"pair\") was correctly translated as \"一对\", but the glossary explicitly requires \"Pair Plus\" to be \"Pair Plus旁注\". Wait, the segment says \"a pear\", which is \"a pair\". The glossary says \"pair": "一对\". So \"一对\" is correct. However, the previous analysis noted \"pear\" is an ASR error. The translation handled it correctly. No error here.",
+    "play\" (referring to the Play bet) translated as \"跟注\" (call) is incorrect. The glossary specifies \"Play bet": "Play注\". The action is \"Play\", not \"Call\". \"跟注\" implies a different game mechanic. Correct translation should use \"Play注\" or \"下Play注\".",
+    "Queen high\" translated as \"Q高或更好牌型\" is incorrect; \"Queen high\" means the highest card is a Queen, whereas \"Q高或更好\" implies a threshold (Queen or better). The glossary specifies \"Queen Higher Better\" for the threshold, but \"Queen high": "translated as \"Q高\" or \"至少Q高\".",
+    "The ASR error \"Trifectabet\" in the source text was correctly handled as \"Trifecta注\" in the translation, but the glossary rule explicitly states \"Trifectabet": "Trifecta bet\". The translation \"Trifecta注\" is acceptable per the glossary for \"Trifecta bet\", but the segment ends abruptly with \"Trifecta注\" which looks like a dangling term rather than a complete sentence or proper integration. However, the more critical issue is the glossary rule for \"Xactabox\" vs \"Exacta box\". The source says \"Xactabox\" (ASR error for Exacta box). The translation uses \"Exacta复式\". This is correct handling of ASR. Wait, let's re-evaluate [124]. The source ends with \"Trifectabet.\" The translation ends with \"Trifecta注。\". This is a correct handling of the ASR error \"Trifectabet\" to \"Trifecta注\". No error here.",
+    "The phrase \"running a game\" was translated as \"正在举办的游戏\" which is acceptable, but the glossary rule specifically emphasizes including the qualifier indicating active hosting. The translation \"正在举办的游戏\" is slightly awkward as a noun phrase (\"organization that's running a game": "正在举办游戏的组织\"). A more precise translation per the rule \"ensure the translation includes the qualifier indicating active hosting\" would be \"正在举办游戏的组织\". However, the current translation \"正在举办的游戏\" modifies \"organization\" implicitly. Let's look closer. \"organization that's running a game\" -> \"组织正在举办的游戏\". This is grammatically slightly off in Chinese (should be \"正在举办游戏的组织\"). The current translation \"组织正在举办的游戏\" implies the organization *is* the game, or is a dangling modifier. It should be \"正在举办游戏的组织\". This is a **CRITICAL** alignment/grammar issue affecting meaning.",
+    "Triple Spin\" is a specific game feature/title and should be kept in English or translated as \"三重旋转\" (not \"Triple Spin\" mixed with Chinese context, but the glossary implies keeping specific game names in English. However, the glossary rule for \"Wheel of Fortune\" says keep English. \"Triple Spin\" is likely a feature name. The translation \"Triple Spin奖金回合\" is acceptable as a proper noun. Wait, let's re-evaluate. The glossary says \"Wheel of Fortune": "keep English. It doesn't explicitly say \"Triple Spin\". However, \"Triple Spin\" is a specific game mechanic/title. Translating it as \"Triple Spin\" is acceptable. Is there a better error?",
+    "plays\" in the context of \"got the plays down\" refers to \"strategies\" or \"ways to play responsibly\" (based on the glossary \"plays (in responsible gambling context)": "负责任的游戏方式\"). However, the phrase \"got the plays down\" usually means \"learned the strategies\" or \"got the moves down\". The translation \"策略都掌握了\" (strategies mastered) is a reasonable interpretation of the *meaning*, but the glossary specifically defines \"plays\" in this context as \"负责任的游戏方式\". The translation \"策略\" (strategies) is a valid synonym for \"ways to play\" in a general sense, but does it strictly follow the glossary? The glossary says \"plays (in responsible gambling context) = 负责任的游戏方式\". The segment [222] is \"got the plays down\", which is a colloquialism for \"learned the strategies\". The translation \"策略都掌握了\" is acceptable. However, looking at [224], \"For more plays\" is translated as \"更多负责任的游戏方式\". In [222], \"plays\" likely refers to the same concept. \"策略\" is close, but \"负责任的游戏方式\" is the strict glossary term. Is \"策略\" a mistranslation? It's a bit loose. But let's look for a clearer error.",
+    "For more plays\" is translated as \"为了更多负责任的游戏方式\". The glossary specifies \"plays (in responsible gambling context)": "负责任的游戏方式\". The translation is correct. However, the sentence structure \"为了更多负责任的游戏方式，让赌博更有趣\" is slightly awkward but conveys the meaning. Wait, the glossary rule for \"plays\" says \"translate 'more plays' as '更多负责任的游戏方式'\". The translation does exactly that. No error.",
+    "spentastic": "尽情消费的精彩刺激 (Context: Pun on spending money and excitement in casino promos)",
+    "check (poker action)": "过牌 (Action: Passing without betting; distinct from 跟注/call)",
+    "running a game (community context)": "正在举办游戏 (Modifier for organization/venue)"
   },
   "rules": [
     "Recurring mistranslation pattern: when translating content like 'And you should also call if the five community cards make a straight or better.', the model produced '如果五张公共牌组成了一条或更好的牌型，你也应该跟注。' but should have produced '如果五张公共牌形成顺子或更好的牌型，你也应该跟注。'. Found 2 similar cases.",

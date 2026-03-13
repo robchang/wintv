@@ -4,6 +4,7 @@ import os
 import re
 import subprocess
 import tempfile
+import time
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -25,7 +26,6 @@ MAX_NEW_TOKENS = 500
 ASR_CHOICES = [
     "Parakeet TDT 0.6B v3",
     "Granite Speech 3.3-8B",
-    "Qwen3-ASR 1.7B",
 ]
 TRANSLATION_CHOICES = [
     "Qwen2.5-32B-Instruct",
@@ -2723,6 +2723,7 @@ def process_audio(
     """Full pipeline: preprocess, transcribe, translate, yield progressive results.
     Yields tuples of (transcription, translation, raw, status, en_srt, zh_srt, quality_report).
     """
+    print(f"[process_audio] Called with audio_path={audio_path!r} (type={type(audio_path).__name__})", flush=True)
     if audio_path is None:
         raise gr.Error("Please upload an audio file first.")
 
@@ -2731,7 +2732,12 @@ def process_audio(
         return (transcription, translation, raw, status, en_srt, zh_srt, quality)
 
     try:
+        pipeline_start = time.monotonic()
+        timings = {}
+
         yield _yield(status="Preprocessing audio...")
+        t0 = time.monotonic()
+        print(f"[process_audio] Preprocessing {audio_path}", flush=True)
         wav_path = preprocess_to_wav(audio_path)
 
         data, _ = sf.read(wav_path, dtype="float32")
@@ -2741,6 +2747,7 @@ def process_audio(
                 f"Audio is too short ({duration:.2f}s). "
                 "Please upload at least 0.1 seconds of audio."
             )
+        timings["Preprocessing"] = time.monotonic() - t0
 
         # --- Direct AST path (Granite only) ---
         if use_direct_ast and asr_model_name == "Granite Speech 3.3-8B":
@@ -2771,7 +2778,9 @@ def process_audio(
         transcribe_fn = ASR_DISPATCH[asr_model_name]
 
         yield _yield(status=f"Transcribing with {asr_model_name}...")
+        t0 = time.monotonic()
         asr_results = transcribe_fn(wav_path)
+        timings["ASR transcription"] = time.monotonic() - t0
 
         all_transcriptions = [text for _, text, _, _ in asr_results]
         all_translations = [""] * len(asr_results)
@@ -2781,8 +2790,10 @@ def process_audio(
             transcription=" ".join(all_transcriptions),
             status="Detecting domain and loading knowledge...",
         )
+        t0 = time.monotonic()
         tokenizer, model, device = _get_translator(translation_model_name)
         domain_ctx = load_domain_knowledge(all_transcriptions, tokenizer, model, device)
+        timings["Domain detection"] = time.monotonic() - t0
         print(f"  Domain context: {domain_ctx.domain}, "
               f"{len(domain_ctx.glossary)} glossary entries, "
               f"{len(domain_ctx.rules)} rules")
@@ -2792,14 +2803,17 @@ def process_audio(
             transcription=" ".join(all_transcriptions),
             status="Generating video-specific translation brief...",
         )
+        t0 = time.monotonic()
         translation_brief = generate_translation_brief(
             all_transcriptions, domain_ctx, tokenizer, model, device,
         )
+        timings["Translation brief"] = time.monotonic() - t0
 
         # --- Translate in paragraph blocks ---
         blocks = _group_segments_into_blocks(asr_results)
         print(f"  Grouped {len(asr_results)} segments into {len(blocks)} translation blocks")
 
+        t0 = time.monotonic()
         for block_idx, block in enumerate(blocks):
             seg_range = f"segs {block[0][0]+1}-{block[-1][0]+1}"
             yield _yield(
@@ -2824,6 +2838,7 @@ def process_audio(
                 translation=" ".join(t for t in all_translations if t),
                 status=f"Block {block_idx+1}/{len(blocks)} done.",
             )
+        timings["Block translation"] = time.monotonic() - t0
 
         # --- Naturalness evaluation (feeds into cleanup) ---
         naturalness_guidance = ""
@@ -2834,7 +2849,9 @@ def process_audio(
                 translation=" ".join(t for t in all_translations if t),
                 status="Running naturalness evaluation...",
             )
+            t0 = time.monotonic()
             nat_results = naturalness_evaluate(all_transcriptions, all_translations, domain_ctx)
+            timings["Naturalness evaluation"] = time.monotonic() - t0
             if nat_results:
                 # Build guidance for cleanup pass from C/D segments
                 cd_issues = [r for r in nat_results if r["grade"] in ("C", "D")]
@@ -2859,12 +2876,14 @@ def process_audio(
                 translation=" ".join(t for t in all_translations if t),
                 status="Running document consistency cleanup...",
             )
+            t0 = time.monotonic()
             cleaned = cleanup_translation(
                 all_transcriptions, all_translations,
                 translation_model_name, domain_ctx, translation_brief,
                 naturalness_issues=naturalness_guidance,
             )
             all_translations = cleaned
+            timings["Document cleanup"] = time.monotonic() - t0
 
         # --- Build raw output and SRT entries ---
         all_raw = []
@@ -2920,8 +2939,10 @@ def process_audio(
                 status="Running quality evaluation...",
                 en_srt=en_srt_path, zh_srt=zh_srt_path,
             )
+            t0 = time.monotonic()
             eval_issues = quality_evaluate(all_transcriptions, all_translations, domain_ctx)
             quality_report = format_eval_report(eval_issues)
+            timings["Quality evaluation"] = time.monotonic() - t0
 
             # --- Fix Critical Issues ---
             fix_comparisons = []
@@ -2935,6 +2956,7 @@ def process_audio(
                     en_srt=en_srt_path, zh_srt=zh_srt_path,
                     quality=quality_report,
                 )
+                t0 = time.monotonic()
                 fixes, fix_comparisons = fix_critical_segments(
                     critical_issues, all_transcriptions, all_translations,
                     translation_model_name, domain_ctx, translation_brief,
@@ -2963,6 +2985,8 @@ def process_audio(
                     with open(zh_srt_path, "w") as f:
                         f.write(zh_srt)
 
+                timings["Critical fixes"] = time.monotonic() - t0
+
                 # Append comparison to quality report
                 comparison_text = format_fix_comparison(fix_comparisons)
                 if comparison_text:
@@ -2988,6 +3012,16 @@ def process_audio(
         except Exception as e:
             print(f"  Feedback-to-KB failed (non-blocking): {e}")
 
+        # --- Timing Report ---
+        timings["Total pipeline"] = time.monotonic() - pipeline_start
+        timing_lines = ["\n## Timing"]
+        for step, elapsed in timings.items():
+            if step == "Total pipeline":
+                continue
+            timing_lines.append(f"- {step}: {elapsed:.1f}s")
+        timing_lines.append(f"- **Total: {timings['Total pipeline']:.1f}s**")
+        quality_report += "\n".join(timing_lines)
+
         yield _yield(
             transcription=" ".join(all_transcriptions),
             translation=" ".join(t for t in all_translations if t),
@@ -2995,7 +3029,8 @@ def process_audio(
             status=(
                 f"Done! {len(asr_results)} segments in {len(blocks)} blocks — "
                 f"ASR: {asr_model_name}, Translation: {translation_model_name}, "
-                f"Domain: {domain_ctx.domain}"
+                f"Domain: {domain_ctx.domain} — "
+                f"Total: {timings['Total pipeline']:.1f}s"
             ),
             en_srt=en_srt_path, zh_srt=zh_srt_path,
             quality=quality_report,
@@ -3476,13 +3511,326 @@ def run_improvement_loop(
 
 # --- Gradio UI ---
 
+_FFMPEG_STATIC = "/gradio_api/file=" + str(Path(__file__).parent / "static" / "ffmpeg")
+
+FFMPEG_HEAD = (
+    '<script src="' + _FFMPEG_STATIC + '/mp4box.all.min.js"></script>\n'
+    '<script src="' + _FFMPEG_STATIC + '/ffmpeg.js"></script>\n'
+    '<script src="' + _FFMPEG_STATIC + '/ffmpeg-util.js"></script>\n'
+    """
+<script>
+(function() {
+    var VIDEO_EXTS = ['.mp4','.mkv','.mov','.webm','.avi','.wmv','.flv','.ts','.m2ts'];
+    var MP4_EXTS = ['.mp4','.mov','.m4v','.m4a'];  // mp4box.js supported containers
+    var ffmpegInstance = null;
+    var ffmpegLoading = false;
+    var processingVideo = false;
+
+    function getStatusEl() { return document.getElementById('ffmpeg-status'); }
+    function showStatus(msg) {
+        var el = getStatusEl();
+        if (el) { el.style.display = 'block'; el.textContent = msg; }
+    }
+    function hideStatus() {
+        var el = getStatusEl();
+        if (el) el.style.display = 'none';
+    }
+
+    function getExt(filename) {
+        var m = (filename || '').toLowerCase().match(/\\.[^.]+$/);
+        return m ? m[0] : '';
+    }
+    function isVideo(filename) { return VIDEO_EXTS.indexOf(getExt(filename)) >= 0; }
+    function isMp4Family(filename) { return MP4_EXTS.indexOf(getExt(filename)) >= 0; }
+
+    // --- ADTS header builder for raw AAC frames ---
+    var SAMPLE_RATE_TABLE = [96000,88200,64000,48000,44100,32000,24000,22050,16000,12000,11025,8000,7350];
+    function sampleRateIndex(rate) {
+        for (var i = 0; i < SAMPLE_RATE_TABLE.length; i++) {
+            if (SAMPLE_RATE_TABLE[i] === rate) return i;
+        }
+        return 4; // default 44100
+    }
+    function makeAdtsHeader(frameLen, profile, srIndex, channels) {
+        // 7-byte ADTS header (no CRC)
+        var fullLen = frameLen + 7;
+        var hdr = new Uint8Array(7);
+        hdr[0] = 0xFF;
+        hdr[1] = 0xF1;  // MPEG-4, Layer 0, no CRC
+        hdr[2] = ((profile - 1) << 6) | (srIndex << 2) | ((channels >> 2) & 1);
+        hdr[3] = ((channels & 3) << 6) | ((fullLen >> 11) & 3);
+        hdr[4] = (fullLen >> 3) & 0xFF;
+        hdr[5] = ((fullLen & 7) << 5) | 0x1F;
+        hdr[6] = 0xFC;
+        return hdr;
+    }
+
+    // --- Step 1: Extract raw audio track from MP4/MOV using mp4box.js ---
+    function demuxAudioWithMp4box(file) {
+        return new Promise(function(resolve, reject) {
+            var mp4box = MP4Box.createFile();
+            var audioTrackId = null;
+            var audioCodec = '';
+            var audioSamples = [];
+            var audioMeta = { sampleRate: 44100, channels: 2, profile: 2 }; // AAC-LC defaults
+            var totalSize = file.size;
+            var chunkSize = 4 * 1024 * 1024;  // 4 MB chunks
+            var offset = 0;
+
+            mp4box.onReady = function(info) {
+                console.log('[mp4box] File info:', info);
+                // Find first audio track
+                for (var i = 0; i < info.tracks.length; i++) {
+                    var track = info.tracks[i];
+                    if (track.type === 'audio' || (track.codec && track.codec.startsWith('mp4a'))) {
+                        audioTrackId = track.id;
+                        audioCodec = track.codec;
+                        if (track.audio) {
+                            audioMeta.sampleRate = track.audio.sample_rate || 44100;
+                            audioMeta.channels = track.audio.channel_count || 2;
+                        }
+                        // Parse profile from codec string like "mp4a.40.2" → profile 2 (AAC-LC)
+                        var codecParts = audioCodec.split('.');
+                        if (codecParts.length >= 3) {
+                            audioMeta.profile = parseInt(codecParts[2]) || 2;
+                        }
+                        console.log('[mp4box] Found audio track:', audioTrackId, 'codec:', audioCodec,
+                                    'sampleRate:', audioMeta.sampleRate,
+                                    'channels:', audioMeta.channels,
+                                    'profile:', audioMeta.profile);
+                        mp4box.setExtractionOptions(audioTrackId, null, {
+                            nbSamples: 1000
+                        });
+                        break;
+                    }
+                }
+                if (!audioTrackId) {
+                    reject(new Error('No audio track found in video'));
+                    return;
+                }
+                mp4box.start();
+            };
+
+            mp4box.onSamples = function(trackId, ref, samples) {
+                for (var i = 0; i < samples.length; i++) {
+                    audioSamples.push(samples[i].data);
+                }
+                mp4box.releaseUsedSamples(trackId, samples[samples.length - 1].number);
+                showStatus('Demuxing audio... ' + audioSamples.length + ' samples');
+            };
+
+            mp4box.onError = function(e) {
+                console.error('[mp4box] Error:', e);
+                reject(e);
+            };
+
+            // Read file in chunks
+            var reader = new FileReader();
+            function readNextChunk() {
+                if (offset >= totalSize) {
+                    // Done reading - flush and build output
+                    mp4box.flush();
+                    if (audioSamples.length === 0) {
+                        reject(new Error('No audio samples extracted'));
+                        return;
+                    }
+                    // Check if we need ADTS headers (AAC codec)
+                    var needAdts = audioCodec.startsWith('mp4a');
+                    var srIdx = sampleRateIndex(audioMeta.sampleRate);
+                    var prof = audioMeta.profile;
+                    var chans = audioMeta.channels;
+
+                    // Calculate total length (with ADTS headers if needed)
+                    var totalLen = 0;
+                    var adtsSize = needAdts ? 7 : 0;
+                    for (var i = 0; i < audioSamples.length; i++) {
+                        totalLen += adtsSize + audioSamples[i].byteLength;
+                    }
+                    var merged = new Uint8Array(totalLen);
+                    var pos = 0;
+                    for (var j = 0; j < audioSamples.length; j++) {
+                        if (needAdts) {
+                            var hdr = makeAdtsHeader(audioSamples[j].byteLength, prof, srIdx, chans);
+                            merged.set(hdr, pos);
+                            pos += 7;
+                        }
+                        merged.set(new Uint8Array(audioSamples[j]), pos);
+                        pos += audioSamples[j].byteLength;
+                    }
+                    audioSamples = null; // free memory
+                    console.log('[mp4box] Extracted', totalLen, 'bytes of audio data, codec:', audioCodec,
+                                needAdts ? '(ADTS headers added)' : '');
+                    resolve({ data: merged, codec: audioCodec });
+                    return;
+                }
+
+                var end = Math.min(offset + chunkSize, totalSize);
+                var slice = file.slice(offset, end);
+                reader.onload = function(e) {
+                    var buf = e.target.result;
+                    buf.fileStart = offset;
+                    mp4box.appendBuffer(buf);
+                    offset = end;
+                    var pct = Math.round((offset / totalSize) * 100);
+                    showStatus('Reading video file... ' + pct + '%');
+                    // Use setTimeout to avoid blocking UI
+                    setTimeout(readNextChunk, 0);
+                };
+                reader.readAsArrayBuffer(slice);
+            }
+            readNextChunk();
+        });
+    }
+
+    // --- Step 2: Load ffmpeg.wasm ---
+    async function loadFFmpeg() {
+        if (ffmpegInstance) return ffmpegInstance;
+        if (ffmpegLoading) {
+            while (ffmpegLoading) await new Promise(function(r) { setTimeout(r, 200); });
+            return ffmpegInstance;
+        }
+        ffmpegLoading = true;
+        try {
+            var ff = new FFmpegWASM.FFmpeg();
+            ff.on('progress', function(ev) {
+                var pct = Math.round(ev.progress * 100);
+                showStatus('Converting audio to WAV... ' + pct + '%');
+            });
+            ff.on('log', function(ev) { console.log('[ffmpeg]', ev.message); });
+            showStatus('Loading ffmpeg.wasm core (~31 MB, first time only)...');
+            await ff.load({
+                coreURL: '""" + _FFMPEG_STATIC + """/ffmpeg-core.js',
+                wasmURL: '""" + _FFMPEG_STATIC + """/ffmpeg-core.wasm',
+            });
+            ffmpegInstance = ff;
+            console.log('[ffmpeg-hook] ffmpeg.wasm loaded successfully');
+            return ff;
+        } catch (e) {
+            console.error('ffmpeg.wasm load failed:', e);
+            showStatus('ffmpeg.wasm unavailable');
+            ffmpegLoading = false;
+            return null;
+        } finally {
+            ffmpegLoading = false;
+        }
+    }
+
+    // --- Step 3: Re-encode raw audio to 16kHz mono WAV using ffmpeg.wasm ---
+    async function encodeToWav(audioData, codec) {
+        var ff = await loadFFmpeg();
+        if (!ff) return null;
+
+        // Determine input format from codec
+        var inputExt = 'aac';  // default
+        if (codec.startsWith('mp4a')) inputExt = 'aac';
+        else if (codec.startsWith('ac-3') || codec.startsWith('ec-3')) inputExt = 'ac3';
+        else if (codec.startsWith('alac')) inputExt = 'caf';
+        else if (codec.startsWith('fLaC')) inputExt = 'flac';
+
+        var inputName = 'input.' + inputExt;
+        showStatus('Converting audio to WAV...');
+        await ff.writeFile(inputName, audioData);
+        await ff.exec([
+            '-i', inputName,
+            '-vn', '-acodec', 'pcm_s16le',
+            '-ac', '1', '-ar', '16000',
+            'output.wav'
+        ]);
+        var wavData = await ff.readFile('output.wav');
+        await ff.deleteFile(inputName);
+        await ff.deleteFile('output.wav');
+        return wavData;
+    }
+
+    // --- Full pipeline ---
+    async function extractAudio(file) {
+        if (processingVideo) return null;
+        processingVideo = true;
+
+        try {
+            if (isMp4Family(file.name)) {
+                // MP4/MOV: use mp4box.js to demux (low memory), then ffmpeg.wasm to encode
+                showStatus('Demuxing audio from video...');
+                var result = await demuxAudioWithMp4box(file);
+                console.log('[pipeline] Demuxed', (result.data.length / 1024 / 1024).toFixed(1),
+                            'MB of', result.codec, 'audio');
+
+                var wavData = await encodeToWav(result.data, result.codec);
+                result.data = null; // free memory
+                if (!wavData) {
+                    processingVideo = false;
+                    return null;
+                }
+
+                var wavBlob = new Blob([wavData.buffer], { type: 'audio/wav' });
+                var wavFile = new File([wavBlob],
+                    file.name.replace(/\\.[^.]+$/, '.wav'),
+                    { type: 'audio/wav' }
+                );
+                showStatus('Audio extracted (' +
+                    (wavBlob.size / 1024 / 1024).toFixed(1) + ' MB). Uploading...');
+                setTimeout(hideStatus, 5000);
+                processingVideo = false;
+                return wavFile;
+            } else {
+                // Non-MP4 (MKV, WebM, AVI): fall back to server-side processing
+                console.log('[pipeline] Non-MP4 container, falling back to server-side extraction');
+                showStatus('Non-MP4 video — uploading for server-side audio extraction...');
+                setTimeout(hideStatus, 3000);
+                processingVideo = false;
+                return null;  // null = let original file upload
+            }
+        } catch (err) {
+            console.error('Audio extraction failed:', err);
+            showStatus('Extraction failed — uploading for server-side processing.');
+            setTimeout(hideStatus, 4000);
+            processingVideo = false;
+            return null;
+        }
+    }
+
+    // Global capture-phase interceptor on document.
+    document.addEventListener('change', async function(e) {
+        var input = e.target;
+        if (input.tagName !== 'INPUT' || input.type !== 'file') return;
+        if (!input.closest('#file-input')) return;
+
+        var file = input.files && input.files[0];
+        if (!file || !isVideo(file.name) || processingVideo) return;
+
+        console.log('[ffmpeg-hook] Intercepted video upload:', file.name,
+                    '(' + (file.size / 1024 / 1024).toFixed(0) + ' MB)');
+
+        e.stopImmediatePropagation();
+        e.preventDefault();
+
+        var wavFile = await extractAudio(file);
+        if (wavFile) {
+            var dt = new DataTransfer();
+            dt.items.add(wavFile);
+            input.files = dt.files;
+        }
+        input.dispatchEvent(new Event('change', { bubbles: true }));
+    }, true);
+
+    console.log('[ffmpeg-hook] Global capture interceptor installed (mp4box.js + ffmpeg.wasm)');
+})();
+</script>
+""" + "")
+
 with gr.Blocks(title="English Audio → Mandarin Chinese") as demo:
     gr.Markdown("# English Audio → Mandarin Chinese")
     gr.Markdown(
-        "Upload an English audio file. Select ASR and translation models, "
+        "Upload an English audio or video file. Select ASR and translation models, "
         "then click to transcribe and translate. Long audio is automatically "
-        "segmented based on the ASR model's limits."
+        "segmented based on the ASR model's limits. "
+        "Video files are converted to audio in your browser before uploading."
     )
+
+    # --- ffmpeg.wasm status indicator (JS injected via gr.Blocks js= param) ---
+    gr.HTML("""<div id="ffmpeg-status" style="display:none; padding:8px 12px; margin:4px 0;
+         background:#1a1a2e; border:1px solid #444; border-radius:6px; color:#ccc;
+         font-size:0.9em;"></div>""")
 
     with gr.Row():
         asr_dropdown = gr.Dropdown(
@@ -3496,10 +3844,37 @@ with gr.Blocks(title="English Audio → Mandarin Chinese") as demo:
             label="Translation Model (English → Chinese)",
         )
 
-    audio_input = gr.Audio(
-        label="Upload Audio File",
-        sources=["upload"],
+    audio_input = gr.File(
+        label="Upload Audio or Video File",
+        file_types=[
+            ".wav", ".mp3", ".m4a", ".flac",
+            ".mp4", ".mkv", ".mov", ".webm", ".avi",
+        ],
         type="filepath",
+        elem_id="file-input",
+    )
+
+    audio_preview = gr.Audio(
+        label="Audio Preview",
+        interactive=False,
+        type="filepath",
+    )
+
+    def update_audio_preview(filepath):
+        """Show audio preview for uploaded files (audio pass-through, video after extraction)."""
+        if not filepath:
+            return None
+        ext = Path(filepath).suffix.lower()
+        audio_exts = {".wav", ".mp3", ".m4a", ".flac"}
+        if ext in audio_exts:
+            return filepath
+        return None
+
+    audio_input.change(
+        fn=update_audio_preview,
+        inputs=[audio_input],
+        outputs=[audio_preview],
+        show_progress="hidden",
     )
 
     use_direct_ast = gr.Checkbox(
@@ -3518,7 +3893,7 @@ with gr.Blocks(title="English Audio → Mandarin Chinese") as demo:
         use_quality_eval = gr.Checkbox(
             label="Quality scoring",
             info="Two-layer quality evaluation: rule-based checks + LLM review (requires llama-server on port 8081).",
-            value=False,
+            value=True,
         )
         use_naturalness_eval = gr.Checkbox(
             label="Naturalness evaluation",
@@ -3653,4 +4028,9 @@ with gr.Blocks(title="English Audio → Mandarin Chinese") as demo:
         )
 
 if __name__ == "__main__":
-    demo.launch(server_name="0.0.0.0", server_port=7860, show_error=True)
+    static_dir = str(Path(__file__).parent / "static")
+    demo.launch(
+        server_name="0.0.0.0", server_port=7860, show_error=True,
+        head=FFMPEG_HEAD,
+        allowed_paths=[static_dir],
+    )

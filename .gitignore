@@ -205,3 +205,6 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# ffmpeg.wasm and mp4box.js static files (large WASM binary)
+static/ffmpeg/
